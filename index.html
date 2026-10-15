@@ -348,6 +348,10 @@ kbd { font: 600 11.5px var(--f); background: var(--soft); border: 1px solid var(
 .lcat { margin-left: 8px } .lct { font-size: 11px; font-weight: 800; opacity: .75; margin: 4px 0 }
 .lf { margin: 2px 0 4px 8px } .lfh { display: flex; align-items: center; gap: 6px; cursor: pointer }
 .lcs { display: flex; flex-direction: column; margin-left: 24px } .lc { display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; padding: 1px 0 }
+
+/* acta desde BasketApp */
+.aRow { display: block; width: 100%; text-align: left; background: none; border: 0; border-bottom: 1px solid var(--line, #eee); padding: 8px 6px; cursor: pointer; font: inherit; color: inherit; border-radius: 8px }
+.aRow:hover { background: rgba(122,31,43,.07) } .aRow.sug { background: rgba(245,158,11,.10) }
 </style>
 </head>
 <body>
@@ -365,6 +369,7 @@ kbd { font: 600 11.5px var(--f); background: var(--soft); border: 1px solid var(
     </div></div>
   <div class="menu" id="mActa"><button class="btn" id="bActa">Acta FCBQ</button>
     <div class="pop">
+      <button type="button" id="bActaBA">🏀 Del partido en BasketApp…</button>
       <label>Cargar estadísticas y jugada a jugada (.json)…<input type="file" id="fActa" accept=".json" multiple></label>
       <button id="bRoster">Ver equipos y apodos</button>
     </div></div>
@@ -2478,7 +2483,7 @@ kbd { font: 600 11.5px var(--f); background: var(--soft); border: 1px solid var(
   let saveT;
   // guardado automático + historial para deshacer / rehacer cualquier cambio (Ctrl+Z / Ctrl+Y)
   const UNDO = [], REDO = []; let lastSnap = null;
-  const commit = () => { saveT = null; const j = JSON.stringify(P); if (lastSnap !== null && j !== lastSnap) { UNDO.push(lastSnap); if (UNDO.length > 100) UNDO.shift(); REDO.length = 0; } lastSnap = j; try { localStorage.setItem(LS, j); } catch (e) { } };
+  const commit = () => { saveT = null; const j = JSON.stringify(P); if (lastSnap !== null && j !== lastSnap) { UNDO.push(lastSnap); if (UNDO.length > 100) UNDO.shift(); REDO.length = 0; } lastSnap = j; try { localStorage.setItem(LS, j); S.saveWarned = false; } catch (e) { if (!S.saveWarned) { S.saveWarned = true; toast('⚠️ El montaje es demasiado grande para guardarse solo en este navegador: usa «Proyecto › Guardar proyecto» o el paquete .zip para no perder los cambios', 9000); } } };
   const autosave = () => { clearTimeout(saveT); saveT = setTimeout(commit, 350); };
   const flushSave = () => { if (saveT) { clearTimeout(saveT); commit(); } };
   const resetHistory = () => { UNDO.length = 0; REDO.length = 0; lastSnap = JSON.stringify(P); };
@@ -2684,9 +2689,16 @@ kbd { font: 600 11.5px var(--f); background: var(--soft); border: 1px solid var(
 
   // ───────────────────────── acta FCBQ ─────────────────────────
   async function loadActa(files) {
+    try { const docs = []; for (const f of files) docs.push(JSON.parse(await f.text())); await applyActa(docs); }
+    catch (err) { toast('No he podido leer el acta: ' + err.message, 5000); }
+  }
+  // fresh: un acta entera (de BasketApp); si no, se junta con lo cargado antes en esta sesión (p. ej. estadísticas y
+  // después el jugada a jugada en otro archivo: antes la 2ª carga olvidaba la 1ª)
+  async function applyActa(docs, fresh) {
     try {
-      const docs = []; for (const f of files) docs.push(JSON.parse(await f.text()));
-      const docs2 = P.game && P.game._docs ? [...P.game._docs, ...docs] : docs;
+      const kinds = d => G.detect(d);
+      const prev = fresh ? [] : (S.actaDocs || []).filter(d => !docs.some(n => kinds(n) === kinds(d)));
+      const docs2 = [...prev, ...docs]; S.actaDocs = docs2;
       const g = G.parse(docs2); g._docs = undefined;
       P.game = g;
       // nuestro equipo: el que aparece en las carpetas de los clips, si no el local
@@ -2700,6 +2712,77 @@ kbd { font: 600 11.5px var(--f); background: var(--soft); border: 1px solid var(
     } catch (err) { toast('No he podido leer el acta: ' + err.message, 5000); }
   }
   $('#fActa').onchange = e => { loadActa([...e.target.files]); e.target.value = ''; closeMenus(); };
+  // ───────────────────────── acta desde un partido de BasketApp ─────────────────────────
+  // BasketApp guarda el jugada a jugada de la FCBQ en su formato antiguo (texto en catalán + nº de jugada). Aquí se pasa
+  // al formato que lee el montador (códigos D2, F3, P2, AT…) y se monta el acta igual que si se cargaran los .json.
+  const BA_CODE = [
+    [/^cistella de ([123])/i, m => 'D' + m[1]], [/^intent fallat de ([123])/i, m => 'F' + m[1]], [/esmaixada/i, () => 'MA'],
+    [/^personal\D*(\d) tir/i, m => 'P' + m[1]], [/^personal/i, () => 'P'], [/^antiesportiva\D*(\d)/i, m => 'FL' + m[1]], [/^antiesportiva/i, () => 'FL2'],
+    [/^falta en atac/i, () => 'AT'], [/compensada/i, () => 'TC'], [/t[eè]cnica|^falta t[eè]cnica/i, () => 'T21'], [/desqualificant/i, () => 'DI0'],
+    [/^falta rebuda/i, () => 'FR'], [/^rebot defensiu/i, () => 'RD'], [/^rebot ofensiu/i, () => 'RO'], [/recuperaci|robatori/i, () => 'REC'],
+    [/p[eè]rdua/i, () => 'PER'], [/assist/i, () => 'AS'], [/^tap rebut/i, () => 'TR'], [/^tap/i, () => 'TP'], [/^entra al camp/i, () => 'IN'],
+    [/^surt del camp/i, () => 'OUT'], [/^temps mort/i, () => 'TM'], [/^inici de per/i, () => 'INIPER'], [/^final de per/i, () => 'FINPER'], [/^salt/i, () => 'JB'],
+  ];
+  const baCode = txt => { for (const [re, f] of BA_CODE) { const m = String(txt || '').match(re); if (m) return f(m); } return 'X'; };
+  // datos del partido (formato de BasketApp) → [estadísticas, jugada a jugada] en formato FCBQ nuevo
+  G.fromBasketApp = (m) => {
+    const L = String(m.localId ?? 'L'), V = String(m.visitId ?? 'V'), mv = m.fcbqMoves || [];
+    const pbp = mv.map(x => ({ period: +x.period || 1, minute: +x.min || 0, second: +x.sec || 0, eventTypeCode: baCode(x.move), teamUuid: x.idTeam != null ? String(x.idTeam) : '',
+      uuid: x.actorId != null ? String(x.actorId) : '', dorsal: x.actorShirtNumber != null ? String(x.actorShirtNumber) : '', actorName: x.actorName || '' }));
+    // plantillas: los jugadores de BasketApp (con titulares) y su id del jugada a jugada por dorsal
+    const side = (tid, players) => {
+      const byD = {}; pbp.forEach(e => { if (e.teamUuid === tid && e.uuid && e.dorsal !== '') byD[String(+e.dorsal)] = { uuid: e.uuid, n: e.actorName }; });
+      // titulares: los que marca BasketApp y, si faltan, los que actúan antes de «entrar al campo» (máximo 5)
+      const first = {}; pbp.forEach(e => { if (e.teamUuid === tid && e.uuid && !(e.uuid in first)) first[e.uuid] = e.eventTypeCode; });
+      const out = (players || []).filter(p => p && p.name).map(p => { const d = String(p.dorsal ?? ''), k = byD[String(+d)];
+        const mm = String(p.min || '').match(/(\d+):(\d+)/), sec = mm ? +mm[1] * 60 + +mm[2] : 0;
+        return { uuid: k ? k.uuid : 'd' + d + '-' + tid, dorsal: d, name: p.name, starting: !!p.starter, computed: { seconds: sec } }; });
+      for (const q of out) { if (out.filter(x => x.starting).length >= 5) break; if (!q.starting && first[q.uuid] && first[q.uuid] !== 'IN') q.starting = true; }
+      return out;
+    };
+    const stats = { header: { date: m.date || '', competitionName: m.competition || '', localTeam: { name: m.homeTeam || '', uuid: L }, visitorTeam: { name: m.awayTeam || '', uuid: V },
+        score: m.scoreHome != null ? { local: +m.scoreHome, visitor: +m.scoreAway } : null },
+      boxscore: [{ period: 0, local: { name: m.homeTeam || '', uuid: L, players: side(L, m.homePlayers) }, visitor: { name: m.awayTeam || '', uuid: V, players: side(V, m.awayPlayers) } }] };
+    return [stats, { playByPlay: pbp }];
+  };
+  async function baQuery(qs) {
+    const r = await fetch(BA.url + '/rest/v1/matches?' + qs, { headers: { apikey: BA.key, Authorization: 'Bearer ' + BA.key } });
+    if (!r.ok) throw new Error('No se ha podido leer BasketApp (' + r.status + ')'); return r.json();
+  }
+  function openActaBA() {
+    closeMenus();
+    const m = document.createElement('div'); m.className = 'modal'; m.id = 'actaModal';
+    m.innerHTML = `<div class="box lib"><div class="row"><h2>Acta desde BasketApp</h2><span class="grow"></span><button class="btn" id="aClose">Cerrar</button></div>
+      <div class="row"><input class="in" id="aQ" placeholder="Buscar equipo…" style="flex:1"></div>
+      <div id="aBody" class="libbody"><div class="note">Cargando los partidos importados de la FCBQ…</div></div>
+      <div class="row"><span class="num" id="aTxt">Elige el partido de los clips: el acta (plantillas, titulares, cambios y jugada a jugada) se carga sola.</span></div></div>`;
+    document.body.appendChild(m);
+    const close = () => m.remove(); $('#aClose').onclick = close; m.onclick = e => { if (e.target === m) close(); };
+    let rows = [];
+    const here = norm(clips().map(c => c.path).join(' '));   // equipos de los clips → partidos sugeridos primero
+    const score = r => [r.home_team, r.away_team].reduce((a, t) => a + (t && here.includes(norm(t).split(/\s+-\s+|\s+/).filter(w => w.length > 3)[0] || '§') ? 1 : 0), 0);
+    const dkey = d => { const x = String(d || '').match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/); return x ? +x[3] * 1e4 + +x[2] * 100 + +x[1] : 0; };
+    const draw = () => {
+      const q = norm($('#aQ').value || '');
+      const list = rows.filter(r => !q || norm(r.home_team + ' ' + r.away_team + ' ' + (r.competition || '')).includes(q));
+      $('#aBody').innerHTML = list.slice(0, 200).map(r => `<button type="button" class="aRow${r._s ? ' sug' : ''}" data-id="${esc(r.id)}"><b>${esc(r.home_team)}</b> ${r.sh != null ? `${esc(r.sh)}–${esc(r.sa)}` : 'vs'} <b>${esc(r.away_team)}</b><span class="note"> · ${esc(r.match_date || '')} · ${esc(r.competition || '')}${r._s ? ' · ⭐ de tus clips' : ''}</span></button>`).join('') || '<div class="note">No hay partidos que coincidan.</div>';
+      $$('#aBody .aRow').forEach(b => b.onclick = () => pick(b.dataset.id));
+    };
+    const pick = async id => {
+      $('#aTxt').textContent = 'Cargando el acta…';
+      try {
+        const [d] = await baQuery('select=date:match_data->>date,competition:match_data->>competition,homeTeam:match_data->>homeTeam,awayTeam:match_data->>awayTeam,scoreHome:match_data->scoreHome,scoreAway:match_data->scoreAway,localId:match_data->localId,visitId:match_data->visitId,homePlayers:match_data->homePlayers,awayPlayers:match_data->awayPlayers,fcbqMoves:match_data->fcbqMoves&id=eq.' + encodeURIComponent(id));
+        if (!d || !(d.fcbqMoves || []).length) throw new Error('ese partido no tiene jugada a jugada');
+        await applyActa(G.fromBasketApp(d), true); close();
+      } catch (e) { $('#aTxt').textContent = '⚠️ ' + e.message; }
+    };
+    $('#aQ').oninput = draw;
+    baQuery('select=id,home_team,away_team,competition,match_date,sh:match_data->scoreHome,sa:match_data->scoreAway&match_data->fcbqMoves=not.is.null&limit=3000')
+      .then(r => { rows = r.map(x => ({ ...x, _s: score(x) })).sort((a, b) => (b._s - a._s) || (dkey(b.match_date) - dkey(a.match_date))); draw(); })
+      .catch(e => { $('#aBody').innerHTML = `<div class="note">⚠️ ${esc(e.message)}. Comprueba la conexión.</div>`; });
+  }
+  $('#bActaBA').onclick = openActaBA;
+
 
   // ───────────────────────── proyecto ─────────────────────────
   $('#bSave').onclick = async () => { closeMenus(); const imgs = await MTS.exportImgs(P.items); const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([JSON.stringify(Object.keys(imgs).length ? { ...P, _imgs: imgs } : P)], { type: 'application/json' })); a.download = safeName() + '.montaje.json'; a.click(); toast('Proyecto guardado (el acta va dentro). Para seguir otro día ábrelo y vuelve a añadir la carpeta de clips; para pasárselo a otro, mejor «Pasar a otro (con los clips)»', 6000); };
@@ -4185,7 +4268,7 @@ kbd { font: 600 11.5px var(--f); background: var(--soft); border: 1px solid var(
   // precargar el detector en segundo plano
   setTimeout(() => { DT.load().catch(e => { S.detErr = e.message; }); }, 1500);
   $('#bUndo').onclick = undo; $('#bRedo').onclick = redo; $('#bHelp').onclick = showHelp;
-  window.MONTADOR = { get P() { return P; }, S, addFiles, loadLib, addFromLib, relinkLib, loadActa, renderAll, select, suggest, parseName, clipsOfGroup, summaryLines };
+  window.MONTADOR = { get P() { return P; }, S, addFiles, applyActa, G, loadLib, addFromLib, relinkLib, loadActa, renderAll, select, suggest, parseName, clipsOfGroup, summaryLines };
 })();
 </script>
 </body>
