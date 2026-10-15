@@ -2717,18 +2717,21 @@ kbd { font: 600 11.5px var(--f); background: var(--soft); border: 1px solid var(
   // al formato que lee el montador (códigos D2, F3, P2, AT…) y se monta el acta igual que si se cargaran los .json.
   const BA_CODE = [
     [/^cistella de ([123])/i, m => 'D' + m[1]], [/^intent fallat de ([123])/i, m => 'F' + m[1]], [/esmaixada/i, () => 'MA'],
-    [/^personal\D*(\d) tir/i, m => 'P' + m[1]], [/^personal/i, () => 'P'], [/^antiesportiva\D*(\d)/i, m => 'FL' + m[1]], [/^antiesportiva/i, () => 'FL2'],
+    [/^personal\D*(\d) tir/i, m => 'P' + m[1]], [/^personal \((\d) tl\)/i, m => m[1] === '0' ? 'P' : 'P' + m[1]], [/^personal/i, () => 'P'], [/antiesportiva\D*(\d)/i, m => 'FL' + m[1]], [/antiesportiva/i, () => 'FL2'],
     [/^falta en atac/i, () => 'AT'], [/compensada/i, () => 'TC'], [/t[eè]cnica|^falta t[eè]cnica/i, () => 'T21'], [/desqualificant/i, () => 'DI0'],
     [/^falta rebuda/i, () => 'FR'], [/^rebot defensiu/i, () => 'RD'], [/^rebot ofensiu/i, () => 'RO'], [/recuperaci|robatori/i, () => 'REC'],
     [/p[eè]rdua/i, () => 'PER'], [/assist/i, () => 'AS'], [/^tap rebut/i, () => 'TR'], [/^tap/i, () => 'TP'], [/^entra al camp/i, () => 'IN'],
     [/^surt del camp/i, () => 'OUT'], [/^temps mort/i, () => 'TM'], [/^inici de per/i, () => 'INIPER'], [/^final de per/i, () => 'FINPER'], [/^salt/i, () => 'JB'],
   ];
-  const baCode = txt => { for (const [re, f] of BA_CODE) { const m = String(txt || '').match(re); if (m) return f(m); } return 'X'; };
+  // los partidos importados más nuevos ya guardan algunas jugadas como código («MA» = mate, «T21» = técnica): se usan tal cual
+  const baCode = txt => { const t = String(txt || '').trim(); if (/^[A-Z][A-Z0-9]{0,5}$/.test(t)) return t; for (const [re, f] of BA_CODE) { const m = String(txt || '').match(re); if (m) return f(m); } return 'X'; };
   // datos del partido (formato de BasketApp) → [estadísticas, jugada a jugada] en formato FCBQ nuevo
   G.fromBasketApp = (m) => {
     const L = String(m.localId ?? 'L'), V = String(m.visitId ?? 'V'), mv = m.fcbqMoves || [];
     const pbp = mv.map(x => ({ period: +x.period || 1, minute: +x.min || 0, second: +x.sec || 0, eventTypeCode: baCode(x.move), teamUuid: x.idTeam != null ? String(x.idTeam) : '',
-      uuid: x.actorId != null ? String(x.actorId) : '', dorsal: x.actorShirtNumber != null ? String(x.actorShirtNumber) : '', actorName: x.actorName || '' }));
+      // sin id de jugador (partidos importados más nuevos): se identifica por equipo + dorsal
+      uuid: x.actorId != null ? String(x.actorId) : (x.actorShirtNumber != null && String(x.actorShirtNumber).trim() !== '' && x.idTeam != null ? `d${+x.actorShirtNumber}-${x.idTeam}` : ''),
+      dorsal: x.actorShirtNumber != null ? String(x.actorShirtNumber) : '', actorName: x.actorName || '' }));
     // plantillas: los jugadores de BasketApp (con titulares) y su id del jugada a jugada por dorsal
     const side = (tid, players) => {
       const byD = {}; pbp.forEach(e => { if (e.teamUuid === tid && e.uuid && e.dorsal !== '') byD[String(+e.dorsal)] = { uuid: e.uuid, n: e.actorName }; });
@@ -2736,7 +2739,9 @@ kbd { font: 600 11.5px var(--f); background: var(--soft); border: 1px solid var(
       const first = {}; pbp.forEach(e => { if (e.teamUuid === tid && e.uuid && !(e.uuid in first)) first[e.uuid] = e.eventTypeCode; });
       const out = (players || []).filter(p => p && p.name).map(p => { const d = String(p.dorsal ?? ''), k = byD[String(+d)];
         const mm = String(p.min || '').match(/(\d+):(\d+)/), sec = mm ? +mm[1] * 60 + +mm[2] : 0;
-        return { uuid: k ? k.uuid : 'd' + d + '-' + tid, dorsal: d, name: p.name, starting: !!p.starter, computed: { seconds: sec } }; });
+        return { uuid: k ? k.uuid : `d${+d}-${tid}`, dorsal: d, name: p.name, starting: !!p.starter, computed: { seconds: sec } }; });
+      // jugadores que solo salen en el jugada a jugada (no están en la plantilla guardada en BasketApp)
+      pbp.forEach(e => { if (e.teamUuid === tid && e.uuid && !out.some(q => q.uuid === e.uuid)) out.push({ uuid: e.uuid, dorsal: e.dorsal, name: e.actorName, starting: false, computed: { seconds: 0 } }); });
       for (const q of out) { if (out.filter(x => x.starting).length >= 5) break; if (!q.starting && first[q.uuid] && first[q.uuid] !== 'IN') q.starting = true; }
       return out;
     };
@@ -2765,19 +2770,21 @@ kbd { font: 600 11.5px var(--f); background: var(--soft); border: 1px solid var(
     const draw = () => {
       const q = norm($('#aQ').value || '');
       const list = rows.filter(r => !q || norm(r.home_team + ' ' + r.away_team + ' ' + (r.competition || '')).includes(q));
-      $('#aBody').innerHTML = list.slice(0, 200).map(r => `<button type="button" class="aRow${r._s ? ' sug' : ''}" data-id="${esc(r.id)}"><b>${esc(r.home_team)}</b> ${r.sh != null ? `${esc(r.sh)}–${esc(r.sa)}` : 'vs'} <b>${esc(r.away_team)}</b><span class="note"> · ${esc(r.match_date || '')} · ${esc(r.competition || '')}${r._s ? ' · ⭐ de tus clips' : ''}</span></button>`).join('') || '<div class="note">No hay partidos que coincidan.</div>';
+      $('#aBody').innerHTML = list.slice(0, 200).map(r => `<button type="button" class="aRow${r._s ? ' sug' : ''}" data-id="${esc(r.id)}"><b>${esc(r.home_team)}</b> vs <b>${esc(r.away_team)}</b><span class="note"> · ${esc(r.match_date || '')} · ${esc(r.competition || '')}${r._s ? ' · ⭐ de tus clips' : ''}</span></button>`).join('') || '<div class="note">No hay partidos que coincidan.</div>';
       $$('#aBody .aRow').forEach(b => b.onclick = () => pick(b.dataset.id));
     };
     const pick = async id => {
       $('#aTxt').textContent = 'Cargando el acta…';
       try {
         const [d] = await baQuery('select=date:match_data->>date,competition:match_data->>competition,homeTeam:match_data->>homeTeam,awayTeam:match_data->>awayTeam,scoreHome:match_data->scoreHome,scoreAway:match_data->scoreAway,localId:match_data->localId,visitId:match_data->visitId,homePlayers:match_data->homePlayers,awayPlayers:match_data->awayPlayers,fcbqMoves:match_data->fcbqMoves&id=eq.' + encodeURIComponent(id));
-        if (!d || !(d.fcbqMoves || []).length) throw new Error('ese partido no tiene jugada a jugada');
+        if (!d || !(d.fcbqMoves || []).length) throw new Error('ese partido no tiene jugada a jugada de la FCBQ (¿es del directo o sin acta?). Elige otro');
         await applyActa(G.fromBasketApp(d), true); close();
       } catch (e) { $('#aTxt').textContent = '⚠️ ' + e.message; }
     };
     $('#aQ').oninput = draw;
-    baQuery('select=id,home_team,away_team,competition,match_date,sh:match_data->scoreHome,sa:match_data->scoreAway&match_data->fcbqMoves=not.is.null&limit=3000')
+    // lista ligera (sin abrir cada partido: filtrar por el jugada a jugada en la base de datos se pasa de tiempo);
+    // la base de datos da 1000 filas por consulta → por páginas. Si el elegido no tiene jugada a jugada, se avisa al elegirlo.
+    (async () => { const all = []; for (let o = 0; o < 20000; o += 1000) { const pg = await baQuery('select=id,home_team,away_team,competition,match_date&order=id.desc&limit=1000&offset=' + o); all.push(...pg); if (pg.length < 1000) break; } return all; })()
       .then(r => { rows = r.map(x => ({ ...x, _s: score(x) })).sort((a, b) => (b._s - a._s) || (dkey(b.match_date) - dkey(a.match_date))); draw(); })
       .catch(e => { $('#aBody').innerHTML = `<div class="note">⚠️ ${esc(e.message)}. Comprueba la conexión.</div>`; });
   }
