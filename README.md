@@ -80,3 +80,8 @@ npm run lint
 ```
 
 Stack: Next.js 15 (App Router, server actions) · Tailwind CSS 4 · Drizzle ORM · SQLite/libSQL (Turso).
+
+## Editor de clips (montador de vídeos de scouting)
+
+Página estática independiente de la app: `public/montador.html`, publicada en `/montador.html`
+(https://fantasy-gamma-blue.vercel.app/montador.html). Todo funciona en el navegador; los clips no se suben a ningún sitio.
