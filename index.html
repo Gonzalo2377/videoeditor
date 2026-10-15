@@ -338,6 +338,16 @@ kbd { font: 600 11.5px var(--f); background: var(--soft); border: 1px solid var(
 .prog { height: 8px; border-radius: 99px } .prog i { transition: width .3s linear }
 @media (max-width: 1250px) { .cols { grid-template-columns: minmax(0, 1fr) } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important } }
+
+/* biblioteca de BasketApp */
+.modal .box.lib { width: min(760px, 100%) }
+.libbody { max-height: 56vh; overflow: auto; border: 1px solid var(--line, #e5e7eb); border-radius: 10px; padding: 6px 10px }
+.lr { border-bottom: 1px solid var(--line, #eee); padding: 6px 0 }
+.lr > summary { cursor: pointer; font-weight: 800; padding: 4px 0 }
+.lt { margin: 4px 0 6px 6px } .ltt { font-weight: 800; font-size: 12px; text-transform: uppercase; margin: 6px 0 2px }
+.lcat { margin-left: 8px } .lct { font-size: 11px; font-weight: 800; opacity: .75; margin: 4px 0 }
+.lf { margin: 2px 0 4px 8px } .lfh { display: flex; align-items: center; gap: 6px; cursor: pointer }
+.lcs { display: flex; flex-direction: column; margin-left: 24px } .lc { display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; padding: 1px 0 }
 </style>
 </head>
 <body>
@@ -348,6 +358,7 @@ kbd { font: 600 11.5px var(--f); background: var(--soft); border: 1px solid var(
   <div class="hist"><button class="btn ghost icon" id="bUndo" title="Deshacer (Ctrl+Z)">↶</button><button class="btn ghost icon" id="bRedo" title="Rehacer (Ctrl+Y)">↷</button><button class="btn ghost icon" id="bHelp" title="Atajos de teclado (?)">?</button></div>
   <div class="menu" id="mClips"><button class="btn" id="bClips">＋ Clips</button>
     <div class="pop">
+      <button type="button" id="bLib">🎬 De la biblioteca de BasketApp…</button>
       <label>Carpeta de clips…<input type="file" id="fDir" webkitdirectory multiple></label>
       <label>Zip de clips…<input type="file" id="fZip" accept=".zip"></label>
       <label>Vídeos sueltos…<input type="file" id="fVids" accept="video/*,.mp4,.mov,.m4v,.webm" multiple></label>
@@ -4034,15 +4045,147 @@ kbd { font: 600 11.5px var(--f); background: var(--soft); border: 1px solid var(
     } finally { S.rendering = false; }
   }
 
+
+  // ───────────────────────── biblioteca de BasketApp ─────────────────────────
+  // Los clips que se cortan en BasketApp están en la nube (Cloudinary) y la lista, en su base de datos (solo lectura,
+  // con la misma clave pública que usa la web). Se bajan en MP4 y entran como si fueran una carpeta del ordenador.
+  // Cada clip recuerda de dónde vino (c.lib): al volver a abrir el montaje se vuelven a bajar solos.
+  const BA = { url: 'https://amjxnjxjtakgsfpisnbq.supabase.co', key: 'sb_publishable_zDk6pygUKObV7uRHWYCGxw_FpAqfR6B' };
+  const mp4Url = url => { try { const u = new URL(url); if (!/(^|\.)cloudinary\.com$/.test(u.hostname) || !u.pathname.includes('/video/upload/')) return null;
+    let p = u.pathname.replace('/video/upload/', '/video/upload/vc_h264,ac_aac,q_auto:best/'); p = /\.[a-z0-9]{2,4}$/i.test(p) ? p.replace(/\.[a-z0-9]{2,4}$/i, '.mp4') : p + '.mp4'; u.pathname = p; u.search = ''; return u.toString(); } catch (e) { return null; } };
+  async function fetchClip(url) {   // MP4 tal cual; los WebM antiguos, convertidos por Cloudinary (la 1ª vez tarda unos segundos)
+    const get = async u => { const r = await fetch(u); if (!r.ok) { const e = new Error('HTTP ' + r.status); e.status = r.status; throw e; } return r.blob(); };
+    if (/\.mp4(\?|$)/i.test(url)) { try { const b = await get(url); if (b.size > 1024) return new Blob([b], { type: 'video/mp4' }); } catch (e) { } }
+    const m = mp4Url(url);
+    if (m) for (let k = 0; k < 6; k++) {
+      try { const b = await get(m); if (b.size > 1024) return new Blob([b], { type: 'video/mp4' }); } catch (e) { if (e.status && ![420, 423, 429].includes(e.status) && e.status < 500) break; }
+      await sleep(1500 * (k + 1));
+    }
+    return await get(url);
+  }
+  const libName = s => String(s || '').replace(/[\\/:*?"<>|]+/g, '-').trim() || 'clip';
+  async function loadLib() {
+    const q = BA.url + '/rest/v1/matches?select=id,nm:match_data->>name,home:match_data->>homeTeam,away:match_data->>awayTeam,vc:match_data->videoClips&match_data->videoClips=not.is.null';
+    const r = await fetch(q, { headers: { apikey: BA.key, Authorization: 'Bearer ' + BA.key } });
+    if (!r.ok) throw new Error('No se ha podido leer la biblioteca (' + r.status + ')');
+    const rows = [];
+    for (const m of await r.json()) {
+      const vc = m.vc || {}, lib = m.nm || `${m.home || ''} vs ${m.away || ''}`, row = { id: m.id, lib, created: vc.created || 0, teams: [] };
+      for (const [team, cats] of Object.entries(vc.teams || {})) {
+        const t = { team, cats: [] };
+        for (const cat of Object.keys(cats || {}).sort((a, b) => (a === 'ataque' ? -1 : b === 'ataque' ? 1 : a.localeCompare(b)))) {
+          const folders = Object.entries(cats[cat] || {}).map(([f, arr]) => ({ name: f, clips: (arr || []).filter(c => c.videoUrl).sort((a, b) => (a.timeSecs || 0) - (b.timeSecs || 0))
+            .map(c => ({ id: String(c.id), label: (c.label || '').trim() || `min ${c.time || ''}`.trim(), url: c.videoUrl, dur: c.dur })) })).filter(f => f.clips.length);
+          if (folders.length) t.cats.push({ cat, folders });
+        }
+        if (t.cats.length) row.teams.push(t);
+      }
+      if (row.teams.length) rows.push(row);
+    }
+    return rows.sort((a, b) => b.created - a.created);
+  }
+  // baja los clips y los mete en el montaje (carpeta = la del clip en BasketApp)
+  async function addFromLib(sel, onProg) {
+    const list = [], seen = new Set(), bad = [];
+    let i = 0;
+    for (const s of sel) {
+      onProg && onProg(++i, sel.length, s.label);
+      try {
+        const blob = await fetchClip(s.url);
+        let base = libName(s.label), key = `BasketApp/${libName(s.lib)}/${libName(s.folder)}/${base}.mp4`;
+        for (let n = 2; seen.has(key) || (S.files.has(key) && !findClipFor(key)); n++) key = `BasketApp/${libName(s.lib)}/${libName(s.folder)}/${base} (${n}).mp4`;
+        seen.add(key); list.push({ path: key, file: new File([blob], key.split('/').pop(), { type: blob.type || 'video/mp4' }), url: s.url });
+      } catch (e) { bad.push(s.label); console.warn('clip de la biblioteca', s.url, e); }
+    }
+    if (list.length) {
+      await addFiles(list.map(({ path, file }) => ({ path, file })));
+      for (const x of list) { const c = clips().find(c => c.key === x.path); if (c) c.lib = x.url; }
+      autosave();
+    }
+    return { ok: list.length, bad };
+  }
+  function openLib() {
+    closeMenus();
+    const m = document.createElement('div'); m.className = 'modal'; m.id = 'libModal';
+    m.innerHTML = `<div class="box lib"><div class="row"><h2>Biblioteca de BasketApp</h2><span class="grow"></span><button class="btn" id="lClose">Cerrar</button></div>
+      <div class="row"><input class="in" id="lQ" placeholder="Buscar equipo, carpeta o clip…" style="flex:1"><span class="note" id="lN"></span></div>
+      <div id="lBody" class="libbody"><div class="note">Cargando la biblioteca…</div></div>
+      <div class="prog" id="lProgW" hidden><i id="lBar"></i></div>
+      <div class="row"><span class="num" id="lTxt"></span><span class="grow"></span><button class="btn pri" id="lAdd" disabled>Añadir al montaje</button></div></div>`;
+    document.body.appendChild(m);
+    const close = () => { if (!S.libBusy) m.remove(); };
+    $('#lClose').onclick = close; m.onclick = e => { if (e.target === m) close(); };
+    let rows = [];
+    const chosen = new Map(), opened = new Set();   // id → clip · partidos abiertos
+    const upd = () => { const n = chosen.size; $('#lN').textContent = n ? `${n} clip${n === 1 ? '' : 's'} elegido${n === 1 ? '' : 's'}` : ''; $('#lAdd').disabled = !n || S.libBusy; $('#lAdd').textContent = n ? `Añadir ${n} al montaje` : 'Añadir al montaje'; };
+    const draw = () => {
+      const q = norm($('#lQ').value || ''), hit = s => !q || norm(s).includes(q);
+      const html = rows.map(r => {
+        const teams = r.teams.map(t => {
+          const cats = t.cats.map(c => {
+            const fs = c.folders.map(f => {
+              const show = hit(r.lib) || hit(t.team) || hit(f.name) || f.clips.some(x => hit(x.label)); if (!show) return '';
+              const all = f.clips.every(x => chosen.has(x.id)), some = f.clips.some(x => chosen.has(x.id));
+              return `<div class="lf"><label class="lfh"><input type="checkbox" data-f="${esc(r.id + '|' + t.team + '|' + c.cat + '|' + f.name)}" ${all ? 'checked' : ''} ${!all && some ? 'data-mixed="1"' : ''}> <b>📁 ${esc(f.name)}</b> <span class="note">${f.clips.length}</span></label>
+                <div class="lcs">${f.clips.map(x => `<label class="lc"><input type="checkbox" data-c="${esc(x.id)}" ${chosen.has(x.id) ? 'checked' : ''}> ${esc(x.label)}${x.dur ? ` <span class="note">${Math.round(x.dur)} s</span>` : ''}</label>`).join('')}</div></div>`;
+            }).join('');
+            return fs ? `<div class="lcat"><div class="lct">${c.cat === 'ataque' ? '⚔️ Ataque' : c.cat === 'defensa' ? '🛡️ Defensa' : esc(c.cat)}</div>${fs}</div>` : '';
+          }).join('');
+          return cats ? `<div class="lt"><div class="ltt">🏀 ${esc(t.team)}</div>${cats}</div>` : '';
+        }).join('');
+        return teams ? `<details class="lr" data-r="${esc(r.id)}" ${q || opened.has(String(r.id)) ? 'open' : ''}><summary>${esc(r.lib)}</summary>${teams}</details>` : '';
+      }).join('');
+      const sc = $('#lBody').scrollTop;   // al redibujar se conservan los partidos abiertos y el scroll
+      $('#lBody').innerHTML = html || '<div class="note">No hay clips que coincidan.</div>'; $('#lBody').scrollTop = sc;
+      $$('#lBody details[data-r]').forEach(d => d.ontoggle = () => { if (d.open) opened.add(d.dataset.r); else opened.delete(d.dataset.r); });
+      $$('#lBody input[data-mixed]').forEach(i => { i.indeterminate = true; });
+      $$('#lBody input[data-c]').forEach(i => i.onchange = () => { const x = byId.get(i.dataset.c); if (i.checked) chosen.set(x.id, x); else chosen.delete(x.id); draw(); upd(); });
+      $$('#lBody input[data-f]').forEach(i => i.onchange = () => { const [rid, team, cat, fname] = i.dataset.f.split('|'), r = rows.find(z => String(z.id) === rid), f = r.teams.find(z => z.team === team).cats.find(z => z.cat === cat).folders.find(z => z.name === fname);
+        f.clips.forEach(x => { if (i.checked) chosen.set(x.id, byId.get(x.id)); else chosen.delete(x.id); }); draw(); upd(); });
+    };
+    const byId = new Map();
+    $('#lQ').oninput = draw;
+    loadLib().then(r => {
+      rows = r; r.forEach(row => row.teams.forEach(t => t.cats.forEach(c => c.folders.forEach(f => f.clips.forEach(x => byId.set(x.id, { ...x, lib: row.lib, team: t.team, folder: f.name }))))));
+      if (!rows.length) { $('#lBody').innerHTML = '<div class="note">La biblioteca no tiene clips con vídeo subido.</div>'; return; }
+      draw(); upd();
+    }).catch(e => { $('#lBody').innerHTML = `<div class="note">⚠️ ${esc(e.message)}. Comprueba la conexión.</div>`; });
+    $('#lAdd').onclick = async () => {
+      const sel = [...chosen.values()]; if (!sel.length) return;
+      S.libBusy = true; upd(); $('#lProgW').hidden = false;
+      try {
+        const r = await addFromLib(sel, (i, n, lab) => { $('#lBar').style.width = (100 * (i - 1) / n) + '%'; $('#lTxt').textContent = `Bajando ${i} de ${n}: ${lab}`; });
+        $('#lBar').style.width = '100%';
+        $('#lTxt').textContent = `${r.ok} clip${r.ok === 1 ? '' : 's'} añadido${r.ok === 1 ? '' : 's'}` + (r.bad.length ? ` · ⚠️ no se han podido bajar: ${r.bad.join(', ')}` : '');
+        chosen.clear(); S.libBusy = false; upd(); if (!r.bad.length) setTimeout(() => m.remove(), 900);
+      } catch (e) { $('#lTxt').textContent = 'Error: ' + e.message; }
+      S.libBusy = false; upd();
+    };
+  }
+  $('#bLib').onclick = openLib;
+  // al abrir un montaje guardado: los clips que vinieron de la biblioteca se vuelven a bajar solos
+  async function relinkLib() {
+    const need = clips().filter(c => c.lib && !S.files.has(c.key)); if (!need.length) return 0;
+    toast(`Bajando ${need.length} clip${need.length === 1 ? '' : 's'} de la biblioteca de BasketApp…`, 60000);
+    let ok = 0;
+    for (const c of need) {
+      try { const blob = await fetchClip(c.lib); S.files.set(c.key, { file: new File([blob], c.key.split('/').pop(), { type: blob.type || 'video/mp4' }), url: URL.createObjectURL(blob) }); ok++; } catch (e) { console.warn('clip', c.lib, e); }
+    }
+    renderTree(); renderMain(); updateRenderBtn(); probeDurations();
+    toast(ok === need.length ? `✅ Clips de la biblioteca listos (${ok})` : `${ok} de ${need.length} clips bajados; los demás no están disponibles`, 5000);
+    return ok;
+  }
+
   // ───────────────────────── arranque ─────────────────────────
   try { const s = localStorage.getItem(LS); if (s) { const p = JSON.parse(s); if (p && p.items) P = p; } } catch (e) { }
   buildEV(); $('#pTitle').value = P.title; resetHistory();
   renderTree(); S.sel = (P.items.find(i => i.type === 'clip') || P.items[0] || {}).id; renderMain();
-  if (clips().length) toast('Montaje recuperado: vuelve a añadir la carpeta o el zip de clips para enlazar los vídeos', 5000);
+  if (clips().some(c => c.lib)) setTimeout(relinkLib, 300);
+  if (clips().some(c => !c.lib)) toast('Montaje recuperado: vuelve a añadir la carpeta o el zip de clips para enlazar los vídeos', 5000);
   // precargar el detector en segundo plano
   setTimeout(() => { DT.load().catch(e => { S.detErr = e.message; }); }, 1500);
   $('#bUndo').onclick = undo; $('#bRedo').onclick = redo; $('#bHelp').onclick = showHelp;
-  window.MONTADOR = { get P() { return P; }, S, addFiles, loadActa, renderAll, select, suggest, parseName, clipsOfGroup, summaryLines };
+  window.MONTADOR = { get P() { return P; }, S, addFiles, loadLib, addFromLib, relinkLib, loadActa, renderAll, select, suggest, parseName, clipsOfGroup, summaryLines };
 })();
 </script>
 </body>
