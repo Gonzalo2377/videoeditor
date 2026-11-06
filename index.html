@@ -2621,18 +2621,76 @@ kbd { font: 600 11.5px var(--f); background: var(--soft); border: 1px solid var(
     const common = c => { const a = String(c.key).split('/').map(loose); let n = 0; while (n < a.length && n < segs.length && a[a.length - 1 - n] === segs[segs.length - 1 - n]) n++; return n; };
     return cand.sort((x, y) => common(y) - common(x))[0];
   }
+  // ── parones grabados en los clips ──
+  // Los clips que BasketApp grababa en directo pueden traer un fotograma que dura más de un segundo (un tirón de esa grabación): se ve la imagen parada y el contador avanzando.
+  // Al cargarlos se quita ese tiempo tocando solo el índice del MP4 fragmentado, sin recodificar. La jugada que se perdió no se puede recuperar: queda un pequeño salto en vez del parón.
+  async function closeGaps(file) {
+    const none = { file, gaps: [] };
+    if (!file || file.size < 16 || file.size > 3e8) return none;
+    const buf = await file.arrayBuffer(), d = new DataView(buf), u8 = new Uint8Array(buf), len = buf.byteLength;
+    const tag = p => String.fromCharCode(u8[p], u8[p + 1], u8[p + 2], u8[p + 3]);
+    const kids = (a, e, fn) => { for (let p = a; p + 8 <= e;) { let z = d.getUint32(p), h = 8; if (z === 1) { z = Number(d.getBigUint64(p + 8)); h = 16; } else if (z === 0) z = e - p; if (z < 8 || p + z > e) break; fn(tag(p + 4), p + h, p + z, p); p += z; } };
+    if (tag(4) !== 'ftyp') return none;
+    let moov = null; const moofs = [];
+    kids(0, len, (t, a, e) => { if (t === 'moov') moov = [a, e]; else if (t === 'moof') moofs.push([a, e]); });
+    if (!moov || !moofs.length) return none;
+    const traks = []; let vid = null, scale = 0; const trex = {};
+    kids(moov[0], moov[1], (t, a, e, p) => {
+      if (t === 'trak') { let id = 0, ts = 0, hd = ''; kids(a, e, (t2, a2, e2) => { if (t2 === 'tkhd') id = d.getUint32(a2 + (u8[a2] ? 20 : 12)); if (t2 === 'mdia') kids(a2, e2, (t3, a3) => { if (t3 === 'mdhd') ts = d.getUint32(a3 + (u8[a3] ? 20 : 12)); if (t3 === 'hdlr') hd = tag(a3 + 8); }); });
+        traks.push({ id, p, hd }); if (hd === 'vide' && vid == null) { vid = id; scale = ts; } }
+      if (t === 'mvex') kids(a, e, (t2, a2) => { if (t2 === 'trex') trex[d.getUint32(a2 + 4)] = d.getUint32(a2 + 12); });
+    });
+    if (vid == null || !scale) return none;
+    // la pista de vídeo, fotograma a fotograma, con dónde está escrita la duración de cada uno
+    const trafs = [], others = [];
+    for (const [ma, me] of moofs) kids(ma, me, (t, a, e, p) => { if (t !== 'traf') return;
+      let id = 0, dd = 0, tf = null; const sm = [];
+      kids(a, e, (t2, a2) => {
+        if (t2 === 'tfhd') { const fl = d.getUint32(a2) & 0xffffff; id = d.getUint32(a2 + 4); dd = trex[id] || 0; let q = a2 + 8; if (fl & 1) q += 8; if (fl & 2) q += 4; if (fl & 8) dd = d.getUint32(q); }
+        if (t2 === 'tfdt') { const v = u8[a2]; tf = { p: a2 + 4, v, dts: v ? Number(d.getBigUint64(a2 + 4)) : d.getUint32(a2 + 4) }; }
+        if (t2 === 'trun') { const fl = d.getUint32(a2) & 0xffffff, n = d.getUint32(a2 + 4); let q = a2 + 8; if (fl & 1) q += 4; if (fl & 4) q += 4;
+          for (let i = 0; i < n; i++) { let du = dd, dp = null; if (fl & 0x100) { dp = q; du = d.getUint32(q); q += 4; } if (fl & 0x200) q += 4; if (fl & 0x400) q += 4; if (fl & 0x800) q += 4; sm.push({ du, dp }); } }
+      });
+      if (id === vid) trafs.push({ tf, sm }); else others.push(p); });
+    if (!trafs.length || trafs.some(x => !x.tf)) return none;
+    const all = []; trafs.forEach((x, k) => { let t = x.tf.dts; x.sm.forEach((s, i) => { s.t = t; s.last = i === x.sm.length - 1; all.push(s); t += s.du; }); });
+    if (all.length < 8) return none;
+    all.forEach((s, i) => { s.eff = i + 1 < all.length ? all[i + 1].t - s.t : s.du; });
+    const med = all.map(s => s.eff).sort((a, b) => a - b)[all.length >> 1], lim = Math.max(0.15 * scale, 4 * med);
+    if (!(med > 0) || !all.some(s => s.eff > lim)) return none;
+    if (all.some(s => s.eff > lim && s.dp == null && !s.last)) return none;
+    // quitar el tiempo de más: nueva duración en el fotograma parado y nuevo inicio de cada fragmento
+    const gaps = []; let cutTot = 0;
+    all.forEach(s => { s.nt = s.t - cutTot; if (s.eff > lim) { gaps.push({ t: +((s.t + med) / scale).toFixed(4), cut: +((s.eff - med) / scale).toFixed(4) }); cutTot += s.eff - med; if (s.dp != null) d.setUint32(s.dp, med); } });
+    for (const x of trafs) { const t = x.sm.length ? x.sm[0].nt : x.tf.dts; if (x.tf.v) d.setBigUint64(x.tf.p, BigInt(t)); else d.setUint32(x.tf.p, t); }
+    // el audio se quedaría descuadrado: se quita de esta copia (el Montador trabaja sin el sonido de los clips)
+    const free = p => { u8[p + 4] = 0x66; u8[p + 5] = 0x72; u8[p + 6] = 0x65; u8[p + 7] = 0x65; };
+    others.forEach(free); traks.filter(x => x.id !== vid).forEach(x => free(x.p));
+    return { file: new File([buf], file.name, { type: file.type || 'video/mp4' }), gaps };
+  }
+  // las pausas, tramos y recortes ya hechos se mueven con el vídeo, para que sigan en la misma jugada
+  function shiftClipTimes(c, gaps) {
+    const m = t => { if (t == null) return t; let o = t; for (const g of gaps) if (t > g.t) o -= Math.min(t - g.t, g.cut); return Math.round(o * 1000) / 1000; };
+    c.inT = m(c.inT || 0); c.outT = m(c.outT); c.dur = m(c.dur);
+    (c.pauses || []).forEach(p => { p.t = m(p.t); });
+    [c.slows, c.zooms, c.subs, c.follows].forEach(l => (l || []).forEach(o => { o.t0 = m(o.t0); o.t1 = m(o.t1); }));
+    (c.follows || []).forEach(f => { if (f.track) { f.track.forEach(q => { q.t = m(q.t); }); f.track = f.track.filter((q, i, a) => !a[i + 1] || a[i + 1].t > q.t); } });
+  }
+  const gapToast = (n, s) => toast(`✂️ Quitado el parón de ${n} clip${n === 1 ? '' : 's'} (${String(Math.round(s * 10) / 10).replace('.', ',')} s en total)`, 5000);
   async function addFiles(list) {
     // list: [{path, file}]
     const vids = list.filter(x => isVideo(x.path)).sort((a, b) => a.path.localeCompare(b.path, 'es', { numeric: true }));
     if (!vids.length) { toast('No hay vídeos en lo que has elegido'); return; }
-    let added = 0, relinked = 0;
-    for (const { path, file } of vids) {
+    let added = 0, relinked = 0, fixedN = 0, fixedS = 0, shifted = false;
+    for (const { path, file: raw } of vids) {
+      const { file, gaps } = await closeGaps(raw).catch(e => { console.warn('parón', e); return { file: raw, gaps: [] }; });
+      if (gaps.length) { fixedN++; fixedS += gaps.reduce((a, g) => a + g.cut, 0); }
       const key = path.replace(/^\/+/, '');
       const prev = S.files.get(key); if (prev && prev.url) URL.revokeObjectURL(prev.url);
       S.files.set(key, { file, url: URL.createObjectURL(file) });
       const name = key.split('/').pop();
       const ex = findClipFor(key);
-      if (ex) { if (ex.key !== key) { S.files.delete(ex.key); ex.key = key; } relinked++; continue; }
+      if (ex) { if (ex.key !== key) { S.files.delete(ex.key); ex.key = key; } if (gaps.length && !ex.gapFix) { shiftClipTimes(ex, gaps); ex.gapFix = gaps; shifted = true; } relinked++; continue; }
       // grupo: la carpeta que contiene el clip
       const parts = key.split('/'), folder = parts.length > 1 ? parts[parts.length - 2] : 'Clips';
       let gi = P.items.findIndex(i => i.type === 'group' && i.folder === folder);
@@ -2645,12 +2703,15 @@ kbd { font: 600 11.5px var(--f); background: var(--soft); border: 1px solid var(
       const pn = parseName(name);
       const c = { id: uid(), type: 'clip', key, name: name.replace(/\.[a-z0-9]{2,4}$/i, ''), path: key, players: pn.players, hint: pn.hint, who: '', concept: pn.concept, result: '', resAuto: true, ev: [], clock: '', inT: 0, outT: null, dur: null, pauses: [], subs: [], slows: [], follows: [], zooms: [], on: true };
       c.who = whoLabels(c).join(' ' + L10N[P.lang].and + ' ');
+      if (gaps.length) c.gapFix = gaps;
       P.items.splice(at, 0, c); added++;
     }
     if (/defensa/i.test(vids.map(v => v.path).join(' ')) && P.title === 'Revisió defensiva') { /* ya es el título por defecto */ }
+    if (shifted) resetHistory();   // deshacer no debe devolver los tiempos de antes de quitar el parón
     autosave(); renderTree();
     if (!S.sel || !item(S.sel)) select((clips()[0] || P.items[0]).id); else renderMain();
     toast(`${added} clips añadidos${relinked ? ` · ${relinked} vueltos a enlazar` : ''}`);
+    if (fixedN) setTimeout(() => gapToast(fixedN, fixedS), 1800);
     probeDurations();
   }
   // duración y tamaño de cada vídeo (en segundo plano)
@@ -4257,11 +4318,16 @@ kbd { font: 600 11.5px var(--f); background: var(--soft); border: 1px solid var(
   async function relinkLib() {
     const need = clips().filter(c => c.lib && !S.files.has(c.key)); if (!need.length) return 0;
     toast(`Bajando ${need.length} clip${need.length === 1 ? '' : 's'} de la biblioteca de BasketApp…`, 60000);
-    let ok = 0;
+    let ok = 0, fixedN = 0, fixedS = 0, shifted = false;
     for (const c of need) {
-      try { const blob = await fetchClip(c.lib); S.files.set(c.key, { file: new File([blob], c.key.split('/').pop(), { type: blob.type || 'video/mp4' }), url: URL.createObjectURL(blob) }); ok++; } catch (e) { console.warn('clip', c.lib, e); }
+      try { const blob = await fetchClip(c.lib), raw = new File([blob], c.key.split('/').pop(), { type: blob.type || 'video/mp4' });
+        const { file, gaps } = await closeGaps(raw).catch(e => { console.warn('parón', e); return { file: raw, gaps: [] }; });
+        if (gaps.length) { fixedN++; fixedS += gaps.reduce((a, g) => a + g.cut, 0); if (!c.gapFix) { shiftClipTimes(c, gaps); c.gapFix = gaps; shifted = true; } }
+        S.files.set(c.key, { file, url: URL.createObjectURL(file) }); ok++; } catch (e) { console.warn('clip', c.lib, e); }
     }
+    if (shifted) { resetHistory(); autosave(); }
     renderTree(); renderMain(); updateRenderBtn(); probeDurations();
+    if (fixedN) setTimeout(() => gapToast(fixedN, fixedS), 5200);
     toast(ok === need.length ? `✅ Clips de la biblioteca listos (${ok})` : `${ok} de ${need.length} clips bajados; los demás no están disponibles`, 5000);
     return ok;
   }
@@ -4275,7 +4341,7 @@ kbd { font: 600 11.5px var(--f); background: var(--soft); border: 1px solid var(
   // precargar el detector en segundo plano
   setTimeout(() => { DT.load().catch(e => { S.detErr = e.message; }); }, 1500);
   $('#bUndo').onclick = undo; $('#bRedo').onclick = redo; $('#bHelp').onclick = showHelp;
-  window.MONTADOR = { get P() { return P; }, S, addFiles, applyActa, G, loadLib, addFromLib, relinkLib, loadActa, renderAll, select, suggest, parseName, clipsOfGroup, summaryLines };
+  window.MONTADOR = { get P() { return P; }, S, closeGaps, addFiles, applyActa, G, loadLib, addFromLib, relinkLib, loadActa, renderAll, select, suggest, parseName, clipsOfGroup, summaryLines };
 })();
 </script>
 </body>
