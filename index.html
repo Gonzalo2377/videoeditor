@@ -2429,10 +2429,12 @@ kbd { font: 600 11.5px var(--f); background: var(--soft); border: 1px solid var(
       if (err) throw err;
       const q = S[k];
       dec.decode(new EncodedVideoChunk({ type: q.key ? 'key' : 'delta', timestamp: Math.round(q.t * 1e6), duration: Math.round(q.dur * 1e6), data: q.data }));
-      while (dec.decodeQueueSize > 4 && !err) await sleep(1);
+      // mientras se espera al decodificador hay que ir soltando los fotogramas que ya ha dado: si no, se queda sin sitio y no avanza nunca
+      while (dec.decodeQueueSize > 4 && !err) { await pump(); await sleep(1); }
       await pump();
     }
-    if (!stop) { await dec.flush().catch(e => { err = err || e; }); await pump(); }
+    // lo mismo al vaciar el decodificador: se van soltando fotogramas mientras termina, o puede quedarse esperando para siempre
+    if (!stop) { let done = false; dec.flush().catch(e => { err = err || e; }).then(() => { done = true; }); while (!done && !err) { await pump(); await sleep(2); } await pump(); }
     for (const f of queue) f.close();
     try { dec.close(); } catch (e) { }
     if (err) throw err;
@@ -2621,76 +2623,220 @@ kbd { font: 600 11.5px var(--f); background: var(--soft); border: 1px solid var(
     const common = c => { const a = String(c.key).split('/').map(loose); let n = 0; while (n < a.length && n < segs.length && a[a.length - 1 - n] === segs[segs.length - 1 - n]) n++; return n; };
     return cand.sort((x, y) => common(y) - common(x))[0];
   }
-  // ── parones grabados en los clips ──
-  // Los clips que BasketApp grababa en directo pueden traer un fotograma que dura más de un segundo (un tirón de esa grabación): se ve la imagen parada y el contador avanzando.
-  // Al cargarlos se quita ese tiempo tocando solo el índice del MP4 fragmentado, sin recodificar. La jugada que se perdió no se puede recuperar: queda un pequeño salto en vez del parón.
-  async function closeGaps(file) {
-    const none = { file, gaps: [] };
-    if (!file || file.size < 16 || file.size > 3e8) return none;
+  // ── clips con un parón grabado ──
+  // Los clips que BasketApp grababa en directo pueden traer un fotograma que dura más de un segundo, y la jugada de ese rato se perdió: no está en el clip.
+  // El Montador no toca el vídeo: lo enseña tal cual, avisa y lo recupera entero del vídeo original del partido (corte exacto, fotograma a fotograma).
+  async function heldFrames(file) {
+    if (!file || file.size < 16 || file.size > 3e8) return [];
     const buf = await file.arrayBuffer(), d = new DataView(buf), u8 = new Uint8Array(buf), len = buf.byteLength;
     const tag = p => String.fromCharCode(u8[p], u8[p + 1], u8[p + 2], u8[p + 3]);
-    const kids = (a, e, fn) => { for (let p = a; p + 8 <= e;) { let z = d.getUint32(p), h = 8; if (z === 1) { z = Number(d.getBigUint64(p + 8)); h = 16; } else if (z === 0) z = e - p; if (z < 8 || p + z > e) break; fn(tag(p + 4), p + h, p + z, p); p += z; } };
-    if (tag(4) !== 'ftyp') return none;
+    const kids = (a, e, fn) => { for (let p = a; p + 8 <= e;) { let z = d.getUint32(p), h = 8; if (z === 1) { z = Number(d.getBigUint64(p + 8)); h = 16; } else if (z === 0) z = e - p; if (z < 8 || p + z > e) break; fn(tag(p + 4), p + h, p + z); p += z; } };
+    if (tag(4) !== 'ftyp') return [];
     let moov = null; const moofs = [];
     kids(0, len, (t, a, e) => { if (t === 'moov') moov = [a, e]; else if (t === 'moof') moofs.push([a, e]); });
-    if (!moov || !moofs.length) return none;
-    const traks = []; let vid = null, scale = 0; const trex = {};
-    kids(moov[0], moov[1], (t, a, e, p) => {
-      if (t === 'trak') { let id = 0, ts = 0, hd = ''; kids(a, e, (t2, a2, e2) => { if (t2 === 'tkhd') id = d.getUint32(a2 + (u8[a2] ? 20 : 12)); if (t2 === 'mdia') kids(a2, e2, (t3, a3) => { if (t3 === 'mdhd') ts = d.getUint32(a3 + (u8[a3] ? 20 : 12)); if (t3 === 'hdlr') hd = tag(a3 + 8); }); });
-        traks.push({ id, p, hd }); if (hd === 'vide' && vid == null) { vid = id; scale = ts; } }
+    if (!moov || !moofs.length) return [];
+    let vid = null, scale = 0; const trex = {};
+    kids(moov[0], moov[1], (t, a, e) => {
+      if (t === 'trak') { let id = 0, ts = 0, hd = ''; kids(a, e, (t2, a2, e2) => { if (t2 === 'tkhd') id = d.getUint32(a2 + (u8[a2] ? 20 : 12)); if (t2 === 'mdia') kids(a2, e2, (t3, a3) => { if (t3 === 'mdhd') ts = d.getUint32(a3 + (u8[a3] ? 20 : 12)); if (t3 === 'hdlr') hd = tag(a3 + 8); }); }); if (hd === 'vide' && vid == null) { vid = id; scale = ts; } }
       if (t === 'mvex') kids(a, e, (t2, a2) => { if (t2 === 'trex') trex[d.getUint32(a2 + 4)] = d.getUint32(a2 + 12); });
     });
-    if (vid == null || !scale) return none;
-    // la pista de vídeo, fotograma a fotograma, con dónde está escrita la duración de cada uno
-    const trafs = [], others = [];
-    for (const [ma, me] of moofs) kids(ma, me, (t, a, e, p) => { if (t !== 'traf') return;
-      let id = 0, dd = 0, tf = null; const sm = [];
+    if (vid == null || !scale) return [];
+    const all = [];
+    for (const [ma, me] of moofs) kids(ma, me, (t, a, e) => { if (t !== 'traf') return;
+      let id = 0, dd = 0, dts = null;
       kids(a, e, (t2, a2) => {
         if (t2 === 'tfhd') { const fl = d.getUint32(a2) & 0xffffff; id = d.getUint32(a2 + 4); dd = trex[id] || 0; let q = a2 + 8; if (fl & 1) q += 8; if (fl & 2) q += 4; if (fl & 8) dd = d.getUint32(q); }
-        if (t2 === 'tfdt') { const v = u8[a2]; tf = { p: a2 + 4, v, dts: v ? Number(d.getBigUint64(a2 + 4)) : d.getUint32(a2 + 4) }; }
-        if (t2 === 'trun') { const fl = d.getUint32(a2) & 0xffffff, n = d.getUint32(a2 + 4); let q = a2 + 8; if (fl & 1) q += 4; if (fl & 4) q += 4;
-          for (let i = 0; i < n; i++) { let du = dd, dp = null; if (fl & 0x100) { dp = q; du = d.getUint32(q); q += 4; } if (fl & 0x200) q += 4; if (fl & 0x400) q += 4; if (fl & 0x800) q += 4; sm.push({ du, dp }); } }
-      });
-      if (id === vid) trafs.push({ tf, sm }); else others.push(p); });
-    if (!trafs.length || trafs.some(x => !x.tf)) return none;
-    const all = []; trafs.forEach((x, k) => { let t = x.tf.dts; x.sm.forEach((s, i) => { s.t = t; s.last = i === x.sm.length - 1; all.push(s); t += s.du; }); });
-    if (all.length < 8) return none;
+        if (t2 === 'tfdt') dts = u8[a2] ? Number(d.getBigUint64(a2 + 4)) : d.getUint32(a2 + 4);
+        if (t2 === 'trun' && id === vid) { const fl = d.getUint32(a2) & 0xffffff, n = d.getUint32(a2 + 4); let q = a2 + 8; if (fl & 1) q += 4; if (fl & 4) q += 4;
+          for (let i = 0; i < n; i++) { let du = dd; if (fl & 0x100) { du = d.getUint32(q); q += 4; } if (fl & 0x200) q += 4; if (fl & 0x400) q += 4; if (fl & 0x800) q += 4; all.push({ t: dts || 0, du }); dts = (dts || 0) + du; } }
+      }); });
+    if (all.length < 8) return [];
     all.forEach((s, i) => { s.eff = i + 1 < all.length ? all[i + 1].t - s.t : s.du; });
     const med = all.map(s => s.eff).sort((a, b) => a - b)[all.length >> 1], lim = Math.max(0.15 * scale, 4 * med);
-    if (!(med > 0) || !all.some(s => s.eff > lim)) return none;
-    if (all.some(s => s.eff > lim && s.dp == null && !s.last)) return none;
-    // quitar el tiempo de más: nueva duración en el fotograma parado y nuevo inicio de cada fragmento
-    const gaps = []; let cutTot = 0;
-    all.forEach(s => { s.nt = s.t - cutTot; if (s.eff > lim) { gaps.push({ t: +((s.t + med) / scale).toFixed(4), cut: +((s.eff - med) / scale).toFixed(4) }); cutTot += s.eff - med; if (s.dp != null) d.setUint32(s.dp, med); } });
-    for (const x of trafs) { const t = x.sm.length ? x.sm[0].nt : x.tf.dts; if (x.tf.v) d.setBigUint64(x.tf.p, BigInt(t)); else d.setUint32(x.tf.p, t); }
-    // el audio se quedaría descuadrado: se quita de esta copia (el Montador trabaja sin el sonido de los clips)
-    const free = p => { u8[p + 4] = 0x66; u8[p + 5] = 0x72; u8[p + 6] = 0x65; u8[p + 7] = 0x65; };
-    others.forEach(free); traks.filter(x => x.id !== vid).forEach(x => free(x.p));
-    return { file: new File([buf], file.name, { type: file.type || 'video/mp4' }), gaps };
+    return med > 0 ? all.filter(s => s.eff > lim).map(s => ({ t: +(s.t / scale).toFixed(3), dur: +(s.eff / scale).toFixed(3) })) : [];
   }
-  // las pausas, tramos y recortes ya hechos se mueven con el vídeo, para que sigan en la misma jugada
-  function shiftClipTimes(c, gaps) {
-    const m = t => { if (t == null) return t; let o = t; for (const g of gaps) if (t > g.t) o -= Math.min(t - g.t, g.cut); return Math.round(o * 1000) / 1000; };
-    c.inT = m(c.inT || 0); c.outT = m(c.outT); c.dur = m(c.dur);
+  // Un montaje guardado con la versión que quitaba el parón tiene los tiempos movidos (c.gapFix): con el clip entero vuelven a su sitio
+  function restoreClipTimes(c) {
+    const gaps = c.gapFix; if (!gaps) return; delete c.gapFix;
+    const m = t => { if (t == null) return t; let o = t; for (const g of gaps) if (o > g.t) o += g.cut; return Math.round(o * 1000) / 1000; };
+    c.inT = c.gapTrim ? 0 : m(c.inT || 0); delete c.gapTrim; c.outT = null; c.dur = null;
     (c.pauses || []).forEach(p => { p.t = m(p.t); });
-    [c.slows, c.zooms, c.subs, c.follows].forEach(l => (l || []).forEach(o => { o.t0 = m(o.t0); o.t1 = m(o.t1); }));
-    (c.follows || []).forEach(f => { if (f.track) { f.track.forEach(q => { q.t = m(q.t); }); f.track = f.track.filter((q, i, a) => !a[i + 1] || a[i + 1].t > q.t); } });
+    [c.slows, c.zooms, c.subs, c.follows].forEach(l => (l || []).forEach(o => { o.t0 = m(o.t0); o.t1 = m(o.t1); (o.path || []).forEach(q => { q.t = m(q.t); }); }));
+    (c.follows || []).forEach(f => (f.track || []).forEach(q => { q.t = m(q.t); }));
   }
-  const gapToast = (n, s) => toast(`✂️ Quitado el parón de ${n} clip${n === 1 ? '' : 's'} (${String(Math.round(s * 10) / 10).replace('.', ',')} s en total)`, 5000);
+  // clips ya recuperados: se guardan en este navegador para no tener que cargar otra vez el original
+  const cleanDb = () => new Promise((ok, ko) => { const q = indexedDB.open('montador-clips', 1); q.onupgradeneeded = () => q.result.createObjectStore('clean'); q.onsuccess = () => ok(q.result); q.onerror = () => ko(q.error); });
+  const cleanGet = async k => { try { const db = await cleanDb(); return await new Promise(ok => { const r = db.transaction('clean').objectStore('clean').get(k); r.onsuccess = () => ok(r.result || null); r.onerror = () => ok(null); }); } catch (e) { return null; } };
+  const cleanPut = async (k, b) => { try { const db = await cleanDb(); await new Promise(ok => { const t = db.transaction('clean', 'readwrite'); t.objectStore('clean').put(b, k); t.oncomplete = ok; t.onerror = ok; }); } catch (e) { console.warn('guardar clip', e); } };
+  const damaged = c => { const f = S.files.get(c.key); return !!(f && ((f.held && f.held.length) || c.gapFix)); };
+  function updateDamageBar() {
+    const n = clips().filter(c => c.on !== false && damaged(c)).length; let bar = document.getElementById('dmgBar');
+    if (!n) { if (bar) bar.remove(); return; }
+    if (!bar) { bar = document.createElement('div'); bar.id = 'dmgBar'; bar.style.cssText = 'position:fixed;left:50%;bottom:14px;transform:translateX(-50%);z-index:9000;display:flex;align-items:center;gap:12px;padding:9px 14px;border-radius:10px;background:#7a1f2b;color:#fff;font:600 13px Poppins,sans-serif;box-shadow:0 6px 20px rgba(0,0,0,.35);max-width:92vw';
+      bar.innerHTML = '<span id="dmgTxt"></span><button type="button" id="dmgGo" style="border:0;border-radius:7px;padding:7px 12px;background:#fff;color:#7a1f2b;font:700 13px Poppins,sans-serif;cursor:pointer;white-space:nowrap">🎞 Recuperar del vídeo original</button><input type="file" id="dmgFile" accept="video/*" multiple style="display:none">'; document.body.appendChild(bar);
+      bar.querySelector('#dmgGo').onclick = () => bar.querySelector('#dmgFile').click();
+      bar.querySelector('#dmgFile').onchange = e => { const fs = [...e.target.files]; e.target.value = ''; if (fs.length) recoverFromOriginal(fs); }; }
+    bar.querySelector('#dmgTxt').textContent = `⚠ ${n} clip${n === 1 ? '' : 's'} con un trozo que falta (parón o salto de cuando se grabó)`;
+  }
+  // Busca cada clip dañado en los vídeos elegidos (por los tiempos de la biblioteca y comparando la imagen) y lo corta entero
+  async function recoverFromOriginal(files) {
+    const need = clips().filter(c => damaged(c)); if (!need.length) return { ok: 0, bad: [] };
+    toast('Buscando los clips en el vídeo original…', 600000);
+    let lib; try { lib = await loadLib(); } catch (e) { toast(e.message + ': prueba otra vez en un momento', 6000); return { ok: 0, bad: [] }; }
+    const times = new Map(); lib.forEach(r => r.teams.forEach(t => t.cats.forEach(k => k.folders.forEach(f => f.clips.forEach(x => times.set(x.url, x))))));
+    const load = f => new Promise((ok, ko) => { const v = document.createElement('video'); v.muted = true; v.preload = 'auto'; v.src = URL.createObjectURL(f); v.onloadeddata = () => ok(v); v.onerror = () => ko(new Error('no se puede leer ' + f.name)); });
+    const srcs = []; for (const file of files) { try { srcs.push({ file, v: await load(file) }); } catch (e) { toast(e.message, 5000); } }
+    const seek = (v, t) => new Promise(ok => { const to = setTimeout(ok, 8000); v.onseeked = () => { clearTimeout(to); setTimeout(ok, 40); }; v.currentTime = t; });
+    const cv = document.createElement('canvas'); cv.width = 160; cv.height = 90; const cx = cv.getContext('2d', { willReadFrequently: true });
+    const sig = v => { cx.drawImage(v, 0, 0, 160, 90); return cx.getImageData(0, 0, 160, 90).data; };
+    let ok = 0, n = 0; const bad = [];
+    for (const c of need) { n++;
+      toast(`Recuperando ${n} de ${need.length}: ${c.name}…`, 600000);
+      const x = c.lib && times.get(c.lib); if (!x || x.a == null || x.b == null) { bad.push(c.name); continue; }
+      const f = S.files.get(c.key); let v0 = null;
+      try { v0 = await load(f.file); const probe = Math.min(0.5, (f.held && f.held[0] ? f.held[0].t : 1) * 0.5); await seek(v0, probe); const ref = sig(v0); let best = null, bestD = 1e9;
+        for (const s of srcs) { if (!(s.v.duration > x.b - 0.5)) continue; await seek(s.v, x.a + probe); const q = sig(s.v); let e = 0; for (let i = 0; i < q.length; i += 8) e += Math.abs(q[i] - ref[i]); e /= q.length / 8; if (e < bestD) { bestD = e; best = s; } }
+        if (!best || bestD > 14) { bad.push(c.name); continue; }
+        const blob = await _cutClipExact(best.file, x.a, x.b, null, best.v), file = new File([blob], c.key.split('/').pop(), { type: 'video/mp4' });
+        await cleanPut(c.lib, blob); if (f.url) URL.revokeObjectURL(f.url);
+        S.files.set(c.key, { file, url: URL.createObjectURL(file), held: [] }); S.thumbs.delete(c.key); restoreClipTimes(c); ok++;
+      } catch (e) { console.warn('recuperar', c.name, e); bad.push(c.name); } finally { if (v0) { URL.revokeObjectURL(v0.src); v0.removeAttribute('src'); } }
+    }
+    srcs.forEach(s => { URL.revokeObjectURL(s.v.src); s.v.removeAttribute('src'); });
+    if (ok) resetHistory();
+    autosave(); renderTree(); renderMain(); updateRenderBtn(); probeDurations();
+    toast(bad.length ? `✅ ${ok} clips recuperados · no están en estos vídeos: ${bad.slice(0, 4).join(', ')}${bad.length > 4 ? '…' : ''}` : `✅ ${ok} clips recuperados enteros`, 8000);
+    return { ok, bad };
+  }
+  // Bitrate de los clips: como el original pero con tope de ~4 Mbps en 1080p (~1,8 en 720p): se sigue viendo nítido y
+  // cada clip pesa 2-4 veces menos que antes (Cloudinary gratis cobra cada MB que se ve). Mínimo 1,5 Mbps.
+  function _clipBps(px, srcBps, dur) {
+    let bps = srcBps ? Math.round(srcBps * 1.2) : Math.round(px * 2);
+    bps = Math.min(Math.round(px * 2), Math.max(1_500_000, bps));
+    return Math.min(bps, Math.floor(85e6 * 8 / Math.max(1, dur + 2)));   // < 85 MB por clip (límite de Cloudinary; R2 admite hasta 300 MB)
+  }
+  // Corta el clip del archivo original fotograma a fotograma (WebCodecs), sin reproducirlo: decodifica desde el fotograma clave anterior, codifica H.264
+  // y copia el audio AAC. Grabar reproduciendo (_recordSegment) deja en el clip cualquier tirón de ese momento: un fotograma quieto y un trozo de jugada perdido.
+  // Solo se leen la cabecera y los fotogramas del clip, así que da igual lo que pese el partido. Si algo no se puede (no es MP4, códec raro…) lanza error y se graba como antes.
+  // MP4 fragmentado (cámaras tipo Veo, OBS…): el índice va repartido en una caja moof por cada trozo. Se leen solo las moof, saltando la imagen.
+  const _fragCache = new WeakMap();   // se lee una vez por archivo: los siguientes clips del mismo partido salen directos
+  async function _mp4FragSamples(file, mp4) {
+    if (_fragCache.has(file)) return _fragCache.get(file);
+    const trex = {}; ((mp4.moov.mvex && mp4.moov.mvex.trexs) || []).forEach(t => { trex[t.track_id] = t; });
+    const scale = {}; mp4.moov.traks.forEach(t => { scale[t.tkhd.track_id] = t.mdia.mdhd.timescale; });
+    const out = {}, next = {};
+    for (let pos = 0; pos + 8 <= file.size;) {
+      const hd = new DataView(await file.slice(pos, pos + 16).arrayBuffer());
+      let z = hd.getUint32(0); const type = String.fromCharCode(hd.getUint8(4), hd.getUint8(5), hd.getUint8(6), hd.getUint8(7));
+      if (z === 1) z = Number(hd.getBigUint64(8)); else if (z === 0) z = file.size - pos;
+      if (z < 8) break;
+      if (type === 'moof') {
+        const d = new DataView(await file.slice(pos, pos + z).arrayBuffer()), moof = pos;
+        const kids = (a, e, fn) => { for (let p = a; p + 8 <= e;) { const n = d.getUint32(p); if (n < 8) break; fn(String.fromCharCode(d.getUint8(p + 4), d.getUint8(p + 5), d.getUint8(p + 6), d.getUint8(p + 7)), p + 8, p + n); p += n; } };
+        kids(8, z, (t, a, e) => { if (t !== 'traf') return;
+          let id = 0, base = moof, dd = 0, ds = 0, df = 0, dts = null, off = null;
+          kids(a, e, (t2, a2) => {
+            if (t2 === 'tfhd') { const fl = d.getUint32(a2) & 0xffffff; id = d.getUint32(a2 + 4); let p = a2 + 8; const x = trex[id] || {}; dd = x.default_sample_duration || 0; ds = x.default_sample_size || 0; df = x.default_sample_flags || 0;
+              if (fl & 1) { base = Number(d.getBigUint64(p)); p += 8; } if (fl & 2) p += 4; if (fl & 8) { dd = d.getUint32(p); p += 4; } if (fl & 0x10) { ds = d.getUint32(p); p += 4; } if (fl & 0x20) df = d.getUint32(p); }
+            if (t2 === 'tfdt') dts = d.getUint8(a2) ? Number(d.getBigUint64(a2 + 4)) : d.getUint32(a2 + 4);
+            if (t2 === 'trun') { const v = d.getUint8(a2), fl = d.getUint32(a2) & 0xffffff, n = d.getUint32(a2 + 4); let p = a2 + 8, ff = null;
+              if (fl & 1) { off = base + d.getInt32(p); p += 4; } else if (off == null) off = base;
+              if (fl & 4) { ff = d.getUint32(p); p += 4; }
+              if (dts == null) dts = next[id] || 0;
+              const list = out[id] || (out[id] = []);
+              for (let i = 0; i < n; i++) { let du = dd, si = ds, sf = i === 0 && ff != null ? ff : df, ct = 0;
+                if (fl & 0x100) { du = d.getUint32(p); p += 4; } if (fl & 0x200) { si = d.getUint32(p); p += 4; } if (fl & 0x400) { sf = d.getUint32(p); p += 4; } if (fl & 0x800) { ct = v ? d.getInt32(p) : d.getUint32(p); p += 4; }
+                list.push({ offset: off, size: si, dts, cts: dts + ct, duration: du, timescale: scale[id], is_sync: !(sf & 0x10000) }); off += si; dts += du; }
+              next[id] = dts; } }); });
+      }
+      pos += z;
+    }
+    _fragCache.set(file, out);
+    return out;
+  }
+  async function _cutClipExact(file, inT, outT, onProgress, vid) {
+    if (!file || typeof VideoEncoder !== 'function' || typeof VideoDecoder !== 'function' || typeof OffscreenCanvas !== 'function') throw new Error('sin WebCodecs');
+    if (String.fromCharCode(...new Uint8Array(await file.slice(4, 8).arrayBuffer())) !== 'ftyp') throw new Error('no es MP4');
+    const [MP4Box, { Muxer, ArrayBufferTarget }] = await Promise.all([import('https://cdn.jsdelivr.net/npm/mp4box@0.5.3/+esm'), import('https://cdn.jsdelivr.net/npm/mp4-muxer@5.1.3/+esm')]);
+    const mp4 = MP4Box.createFile(false); let info = null, failed = null;
+    mp4.onError = e => { failed = new Error('MP4: ' + e); }; mp4.onReady = i => { info = i; };
+    for (let pos = 0; !info && !failed && pos < file.size;) {   // appendBuffer dice por dónde seguir: se salta los datos de imagen hasta el índice
+      const buf = await file.slice(pos, pos + 2097152).arrayBuffer(); buf.fileStart = pos;
+      const next = mp4.appendBuffer(buf); pos = next > pos ? next : pos + buf.byteLength;
+    }
+    if (failed || !info) throw failed || new Error('MP4 sin índice');
+    const vt = info.videoTracks[0], atAny = info.audioTracks[0], at = atAny && /^mp4a/.test(atAny.codec) ? atAny : null;
+    if (!vt || (atAny && !at)) throw new Error('pistas no compatibles');
+    const frag = info.isFragmented ? await _mp4FragSamples(file, mp4) : null, samplesOf = id => frag ? frag[id] || [] : mp4.getTrackSamplesInfo(id) || [];
+    const vS = samplesOf(vt.id); if (!vS.length) throw new Error('MP4 sin fotogramas');
+    const sw = vt.video.width, sh = vt.video.height;
+    if (vid && vid.videoWidth && (vid.videoWidth !== sw || vid.videoHeight !== sh)) throw new Error('vídeo girado');
+    const entry = mp4.getTrackById(vt.id).mdia.minf.stbl.stsd.entries[0], cBox = entry.avcC || entry.hvcC || entry.vpcC || entry.av1C;
+    let description; if (cBox) { const s = new MP4Box.DataStream(undefined, 0, MP4Box.DataStream.BIG_ENDIAN); cBox.write(s); description = new Uint8Array(s.buffer, 8); }
+    const dcfg = { codec: vt.codec, codedWidth: sw, codedHeight: sh, description };
+    if (!(await VideoDecoder.isConfigSupported(dcfg)).supported) throw new Error('códec no soportado: ' + vt.codec);
+
+    const us = s => Math.round(s.cts * 1e6 / s.timescale), base = Math.min(...vS.slice(0, 30).map(us));   // el inicio del vídeo en el reproductor (lista de edición)
+    const t0 = base + Math.round(inT * 1e6), t1 = base + Math.round(outT * 1e6);
+    const srcFps = vS.length / Math.max(0.1, (us(vS[vS.length - 1]) - base) / 1e6);
+    if (us(vS[vS.length - 1]) < t0) throw new Error('índice incompleto');
+    let a = 0; vS.forEach((s, i) => { if (s.is_sync && us(s) <= t0) a = i; });
+    let b = vS.findIndex(s => us(s) >= t1); b = b < 0 ? vS.length : Math.min(vS.length, b + 8);   // unos de más: con fotogramas B el orden de decodificar no es el de mostrar
+    const expected = vS.slice(a, b).filter(s => us(s) >= t0 && us(s) < t1).length;
+    if (expected < (Math.min(outT, vid && vid.duration || outT) - inT) * srcFps * 0.9) throw new Error('índice incompleto');
+
+    const H = sh & ~1, W = sw & ~1, fps = Math.min(60, Math.max(10, Math.round(srcFps))) || 30;
+    const srcBps = (vid && vid.duration) ? file.size * 8 / vid.duration : 0, bitrate = _clipBps(W * H, srcBps, outT - inT);
+    let cfg = null;
+    for (const codec of ['avc1.640028', 'avc1.640032', 'avc1.640033', 'avc1.4d0028', 'avc1.42e01f']) { const c = { codec, width: W, height: H, bitrate, framerate: fps, avc: { format: 'avc' } };
+      try { if ((await VideoEncoder.isConfigSupported(c)).supported) { cfg = c; break; } } catch (e) { } }
+    if (!cfg) throw new Error('sin codificador H.264');
+    let aDesc, aS = [];
+    if (at) { try { aDesc = mp4.getTrackById(at.id).mdia.minf.stbl.stsd.entries[0].esds.esd.descs[0].descs[0].data; } catch (e) { } if (!aDesc) throw new Error('audio no compatible');
+      const all = samplesOf(at.id), aBase = all.length ? us(all[0]) : 0;
+      aS = all.filter(s => us(s) - aBase >= inT * 1e6 && us(s) - aBase < outT * 1e6).map(s => ({ s, t: us(s) - aBase - Math.round(inT * 1e6) })); }
+    const muxer = new Muxer({ target: new ArrayBufferTarget(), fastStart: 'in-memory', firstTimestampBehavior: 'offset',
+      video: { codec: 'avc', width: W, height: H }, audio: at ? { codec: 'aac', numberOfChannels: at.audio.channel_count, sampleRate: at.audio.sample_rate } : undefined });
+    let err = null, nIn = 0, nOut = 0;
+    const enc = new VideoEncoder({ output: (c, m) => { nOut++; muxer.addVideoChunk(c, m); }, error: e => { err = e; } }); enc.configure(cfg);
+    const cv = new OffscreenCanvas(W, H), cx = cv.getContext('2d');
+    const dec = new VideoDecoder({ output: f => { try { const t = f.timestamp; if (t < t0 || t >= t1) return; cx.drawImage(f, 0, 0, W, H);
+        const nf = new VideoFrame(cv, { timestamp: t - t0, duration: f.duration || Math.round(1e6 / fps) }); enc.encode(nf, { keyFrame: nIn % (fps * 2) === 0 }); nf.close(); nIn++;
+        if (onProgress && nIn % 10 === 0) onProgress(Math.min(99, Math.round(nIn / expected * 100))); } finally { f.close(); } }, error: e => { err = e; } });
+    dec.configure(dcfg);
+    const read = s => file.slice(s.offset, s.offset + s.size).arrayBuffer(), idle = () => new Promise(r => setTimeout(r, 0));
+    const addAudio = async q => { muxer.addAudioChunkRaw(new Uint8Array(await read(q.s)), 'key', q.t, Math.round(q.s.duration * 1e6 / q.s.timescale),
+      aFirst ? { decoderConfig: { codec: at.codec, sampleRate: at.audio.sample_rate, numberOfChannels: at.audio.channel_count, description: aDesc } } : undefined); aFirst = false; };
+    let ai = 0, aFirst = true;
+    try {
+      for (let i = a; i < b; i++) {
+        const s = vS[i];
+        while (!err && (dec.decodeQueueSize > 8 || enc.encodeQueueSize > 8)) await idle();
+        if (err) throw err;
+        dec.decode(new EncodedVideoChunk({ type: s.is_sync ? 'key' : 'delta', timestamp: us(s), duration: Math.round(s.duration * 1e6 / s.timescale), data: await read(s) }));
+        for (; ai < aS.length && aS[ai].t <= us(s) - t0; ai++) await addAudio(aS[ai]);   // el audio, intercalado con la imagen
+      }
+      await dec.flush(); await enc.flush();
+      for (; ai < aS.length; ai++) await addAudio(aS[ai]);
+    } finally { try { dec.close(); } catch (e) { } try { enc.close(); } catch (e) { } }
+    if (err) throw err;
+    if (nOut < expected * 0.98) throw new Error(`faltan fotogramas (${nOut} de ${expected})`);
+    muxer.finalize(); if (onProgress) onProgress(100);
+    return new Blob([muxer.target.buffer], { type: 'video/mp4' });
+  }
   async function addFiles(list) {
     // list: [{path, file}]
     const vids = list.filter(x => isVideo(x.path)).sort((a, b) => a.path.localeCompare(b.path, 'es', { numeric: true }));
     if (!vids.length) { toast('No hay vídeos en lo que has elegido'); return; }
-    let added = 0, relinked = 0, fixedN = 0, fixedS = 0, shifted = false;
-    for (const { path, file: raw } of vids) {
-      const { file, gaps } = await closeGaps(raw).catch(e => { console.warn('parón', e); return { file: raw, gaps: [] }; });
-      if (gaps.length) { fixedN++; fixedS += gaps.reduce((a, g) => a + g.cut, 0); }
+    let added = 0, relinked = 0, shifted = false;
+    for (const { path, file } of vids) {
+      const held = await heldFrames(file).catch(e => { console.warn('parón', e); return []; });
       const key = path.replace(/^\/+/, '');
       const prev = S.files.get(key); if (prev && prev.url) URL.revokeObjectURL(prev.url);
-      S.files.set(key, { file, url: URL.createObjectURL(file) });
+      S.files.set(key, { file, url: URL.createObjectURL(file), held });
       const name = key.split('/').pop();
       const ex = findClipFor(key);
-      if (ex) { if (ex.key !== key) { S.files.delete(ex.key); ex.key = key; } if (gaps.length && !ex.gapFix) { shiftClipTimes(ex, gaps); ex.gapFix = gaps; shifted = true; } relinked++; continue; }
+      if (ex) { if (ex.key !== key) { S.files.delete(ex.key); ex.key = key; } if (held.length && ex.gapFix) { restoreClipTimes(ex); shifted = true; } relinked++; continue; }
       // grupo: la carpeta que contiene el clip
       const parts = key.split('/'), folder = parts.length > 1 ? parts[parts.length - 2] : 'Clips';
       let gi = P.items.findIndex(i => i.type === 'group' && i.folder === folder);
@@ -2703,15 +2849,13 @@ kbd { font: 600 11.5px var(--f); background: var(--soft); border: 1px solid var(
       const pn = parseName(name);
       const c = { id: uid(), type: 'clip', key, name: name.replace(/\.[a-z0-9]{2,4}$/i, ''), path: key, players: pn.players, hint: pn.hint, who: '', concept: pn.concept, result: '', resAuto: true, ev: [], clock: '', inT: 0, outT: null, dur: null, pauses: [], subs: [], slows: [], follows: [], zooms: [], on: true };
       c.who = whoLabels(c).join(' ' + L10N[P.lang].and + ' ');
-      if (gaps.length) c.gapFix = gaps;
       P.items.splice(at, 0, c); added++;
     }
     if (/defensa/i.test(vids.map(v => v.path).join(' ')) && P.title === 'Revisió defensiva') { /* ya es el título por defecto */ }
-    if (shifted) resetHistory();   // deshacer no debe devolver los tiempos de antes de quitar el parón
+    if (shifted) resetHistory();   // deshacer no debe devolver los tiempos movidos
     autosave(); renderTree();
     if (!S.sel || !item(S.sel)) select((clips()[0] || P.items[0]).id); else renderMain();
     toast(`${added} clips añadidos${relinked ? ` · ${relinked} vueltos a enlazar` : ''}`);
-    if (fixedN) setTimeout(() => gapToast(fixedN, fixedS), 1800);
     probeDurations();
   }
   // duración y tamaño de cada vídeo (en segundo plano)
@@ -2981,6 +3125,7 @@ kbd { font: 600 11.5px var(--f); background: var(--soft); border: 1px solid var(
   }
   const ready = c => c.pauses.length > 0 && c.pauses.every(p => p.sel.length);
   function renderTree() {
+    updateDamageBar();
     const T = $('#tree');
     T.innerHTML = P.items.map(it => {
       let cls = 'it ' + (it.type === 'intro' || it.type === 'outro' ? 'card' : it.type) + (it.id === S.sel ? ' cur' : '') + (it.on === false ? ' off' : '');
@@ -2989,7 +3134,7 @@ kbd { font: 600 11.5px var(--f); background: var(--soft); border: 1px solid var(
       else if (it.type === 'outro') { ic = '■'; nm = 'Resumen final'; sub = 'Puntos y faltas de las jugadas elegidas'; }
       else if (it.type === 'group') { ic = 'G'; nm = it.title || 'Grupo'; sub = it.sub || ''; }
       else if (it.type === 'slide') { ic = 'T'; nm = it.title || 'Diapositiva'; const t1 = (MTS.migrate(it).els || []).find(e => e.k === 't'); sub = t1 ? String(t1.text).split('\n')[0] : (it.els.length ? 'imagen' : 'vacía'); }
-      else { const f = S.files.get(it.key); if (ready(it)) cls += ' ready'; const ci = clipIndexInGroup(it); ic = ready(it) ? '✓' : ci.i || '·'; const th = S.thumbs.get(it.key); if (th) { ic = `<img src="${th}" alt="">${ready(it) ? '<em>✓</em>' : `<em class="n">${ci.i || '·'}</em>`}`; cls += ' hasth'; } nm = it.name; sub = [it.who, it.clock].filter(Boolean).join(' · ') || (f ? '' : 'falta el vídeo'); st = !f ? '<span class="pill warn">sin vídeo</span>' : it.pauses.length ? `<span class="st">${it.pauses.length} pausa${it.pauses.length > 1 ? 's' : ''}</span>` : ''; }
+      else { const f = S.files.get(it.key); if (ready(it)) cls += ' ready'; const ci = clipIndexInGroup(it); ic = damaged(it) ? '⚠' : ready(it) ? '✓' : ci.i || '·'; const th = S.thumbs.get(it.key); if (th) { ic = `<img src="${th}" alt="">${damaged(it) ? '<em>⚠</em>' : ready(it) ? '<em>✓</em>' : `<em class="n">${ci.i || '·'}</em>`}`; cls += ' hasth'; } nm = it.name; sub = [it.who, it.clock].filter(Boolean).join(' · ') || (f ? '' : 'falta el vídeo'); st = !f ? '<span class="pill warn">sin vídeo</span>' : it.pauses.length ? `<span class="st">${it.pauses.length} pausa${it.pauses.length > 1 ? 's' : ''}</span>` : ''; }
       const drag = it.type !== 'intro' && it.type !== 'outro';
       return `<li class="${cls}" data-id="${it.id}" ${drag ? 'draggable="true"' : ''}><span class="grip">${drag ? '⋮⋮' : ''}</span><span class="ic">${ic}</span><span style="min-width:0"><div class="nm">${esc(nm)}</div>${sub ? `<div class="sub">${esc(sub)}</div>` : ''}</span><span class="end">${st}${drag ? `<button class="x" data-x="${it.id}" title="Quitar del montaje" aria-label="Quitar del montaje">×</button>` : ''}</span></li>`;
     }).join('');
@@ -3155,6 +3300,7 @@ kbd { font: 600 11.5px var(--f); background: var(--soft); border: 1px solid var(
     vid = $('#vid'); cv = $('#cv');
     if (f) vid.src = f.url;
     vid.addEventListener('loadedmetadata', () => {
+      if (!isFinite(vid.duration)) return;   // se cambió de clip mientras cargaba: ya se encarga el nuevo
       f.w = vid.videoWidth; f.h = vid.videoHeight; c.dur = vid.duration; if (c.outT == null || c.outT > vid.duration) c.outT = vid.duration;
       const t0 = S.restoreT != null ? S.restoreT : selPause() ? selPause().t : c.pauses[0] ? c.pauses[0].t : (c.inT || 0); S.restoreT = null;
       vid.currentTime = Math.min(t0, vid.duration); drawBar();
@@ -3767,6 +3913,7 @@ kbd { font: 600 11.5px var(--f); background: var(--soft); border: 1px solid var(
       if (t < z.t0 || t > z.t1) continue;
       const e = D.ease((t - z.t0) / 0.5) * D.ease((z.t1 - t) / 0.5), lv = 1 + (z.z - 1) * e;
       let cx = (z.c ? z.c[0] : 0.5) * vw, cy = (z.c ? z.c[1] : 0.5) * vh;
+      if (z.path && z.path.length) { const P2 = z.path; let k = 0; while (k < P2.length - 2 && P2[k + 1].t < t) k++; const a = P2[k], b = P2[Math.min(k + 1, P2.length - 1)], q = b.t > a.t ? Math.max(0, Math.min(1, (t - a.t) / (b.t - a.t))) : 0, e2 = q * q * (3 - 2 * q); cx = (a.c[0] + (b.c[0] - a.c[0]) * e2) * vw; cy = (a.c[1] + (b.c[1] - a.c[1]) * e2) * vh; }
       const f = z.follow && (c.follows || []).find(q => q.id === z.follow);
       if (f && f.track && f.track.length) {
         const ta = f.track[0].t, tb = f.track[f.track.length - 1].t;
@@ -4216,17 +4363,18 @@ kbd { font: 600 11.5px var(--f); background: var(--soft); border: 1px solid var(
   }
   const libName = s => String(s || '').replace(/[\\/:*?"<>|]+/g, '-').trim() || 'clip';
   async function loadLib() {
-    const q = BA.url + '/rest/v1/matches?select=id,nm:match_data->>name,home:match_data->>homeTeam,away:match_data->>awayTeam,vc:match_data->videoClips&match_data->videoClips=not.is.null';
-    const r = await fetch(q, { headers: { apikey: BA.key, Authorization: 'Bearer ' + BA.key } });
-    if (!r.ok) throw new Error('No se ha podido leer la biblioteca (' + r.status + ')');
+    // todo de golpe tarda más de lo que permite la base de datos (error 500): primero qué partidos tienen clips y luego de 4 en 4
+    const H = { headers: { apikey: BA.key, Authorization: 'Bearer ' + BA.key } }, get = async q => { for (let k = 0; ; k++) { const r = await fetch(BA.url + '/rest/v1/matches?' + q, H); if (r.ok) return r.json(); if (k >= 2) throw new Error('No se ha podido leer la biblioteca (' + r.status + ')'); await sleep(800 * (k + 1)); } };
+    const ids = (await get('select=id&match_data->videoClips=not.is.null')).map(x => x.id), all = [];
+    for (let i = 0; i < ids.length; i += 4) all.push(...await get('select=id,nm:match_data->>name,home:match_data->>homeTeam,away:match_data->>awayTeam,vc:match_data->videoClips&id=in.(' + ids.slice(i, i + 4).join(',') + ')'));
     const rows = [];
-    for (const m of await r.json()) {
+    for (const m of all) {
       const vc = m.vc || {}, lib = m.nm || `${m.home || ''} vs ${m.away || ''}`, row = { id: m.id, lib, created: vc.created || 0, teams: [] };
       for (const [team, cats] of Object.entries(vc.teams || {})) {
         const t = { team, cats: [] };
         for (const cat of Object.keys(cats || {}).sort((a, b) => (a === 'ataque' ? -1 : b === 'ataque' ? 1 : a.localeCompare(b)))) {
           const folders = Object.entries(cats[cat] || {}).map(([f, arr]) => ({ name: f, clips: (arr || []).filter(c => c.videoUrl).sort((a, b) => (a.timeSecs || 0) - (b.timeSecs || 0))
-            .map(c => ({ id: String(c.id), label: (c.label || '').trim() || `min ${c.time || ''}`.trim(), url: c.videoUrl, dur: c.dur })) })).filter(f => f.clips.length);
+            .map(c => ({ id: String(c.id), label: (c.label || '').trim() || `min ${c.time || ''}`.trim(), url: c.videoUrl, dur: c.dur, a: c.timeSecs, b: c.timeEnd })) })).filter(f => f.clips.length);
           if (folders.length) t.cats.push({ cat, folders });
         }
         if (t.cats.length) row.teams.push(t);
@@ -4318,16 +4466,15 @@ kbd { font: 600 11.5px var(--f); background: var(--soft); border: 1px solid var(
   async function relinkLib() {
     const need = clips().filter(c => c.lib && !S.files.has(c.key)); if (!need.length) return 0;
     toast(`Bajando ${need.length} clip${need.length === 1 ? '' : 's'} de la biblioteca de BasketApp…`, 60000);
-    let ok = 0, fixedN = 0, fixedS = 0, shifted = false;
+    let ok = 0, shifted = false;
     for (const c of need) {
-      try { const blob = await fetchClip(c.lib), raw = new File([blob], c.key.split('/').pop(), { type: blob.type || 'video/mp4' });
-        const { file, gaps } = await closeGaps(raw).catch(e => { console.warn('parón', e); return { file: raw, gaps: [] }; });
-        if (gaps.length) { fixedN++; fixedS += gaps.reduce((a, g) => a + g.cut, 0); if (!c.gapFix) { shiftClipTimes(c, gaps); c.gapFix = gaps; shifted = true; } }
-        S.files.set(c.key, { file, url: URL.createObjectURL(file) }); ok++; } catch (e) { console.warn('clip', c.lib, e); }
+      try { const clean = await cleanGet(c.lib), blob = clean || await fetchClip(c.lib), file = new File([blob], c.key.split('/').pop(), { type: blob.type || 'video/mp4' });
+        const held = clean ? [] : await heldFrames(file).catch(() => []);
+        if (c.gapFix && (clean || held.length)) { restoreClipTimes(c); shifted = true; }   // ya tiene su tiempo real: fuera lo que movió la versión anterior
+        S.files.set(c.key, { file, url: URL.createObjectURL(file), held }); ok++; } catch (e) { console.warn('clip', c.lib, e); }
     }
     if (shifted) { resetHistory(); autosave(); }
     renderTree(); renderMain(); updateRenderBtn(); probeDurations();
-    if (fixedN) setTimeout(() => gapToast(fixedN, fixedS), 5200);
     toast(ok === need.length ? `✅ Clips de la biblioteca listos (${ok})` : `${ok} de ${need.length} clips bajados; los demás no están disponibles`, 5000);
     return ok;
   }
@@ -4341,7 +4488,7 @@ kbd { font: 600 11.5px var(--f); background: var(--soft); border: 1px solid var(
   // precargar el detector en segundo plano
   setTimeout(() => { DT.load().catch(e => { S.detErr = e.message; }); }, 1500);
   $('#bUndo').onclick = undo; $('#bRedo').onclick = redo; $('#bHelp').onclick = showHelp;
-  window.MONTADOR = { get P() { return P; }, S, closeGaps, addFiles, applyActa, G, loadLib, addFromLib, relinkLib, loadActa, renderAll, select, suggest, parseName, clipsOfGroup, summaryLines };
+  window.MONTADOR = { get P() { return P; }, S, heldFrames, recoverFromOriginal, addFiles, applyActa, G, loadLib, addFromLib, relinkLib, loadActa, renderAll, select, suggest, parseName, clipsOfGroup, summaryLines };
 })();
 </script>
 </body>
