@@ -4432,13 +4432,16 @@ kbd { font: 600 11.5px var(--f); background: var(--soft); border: 1px solid var(
           }).join('');
           return cats ? `<div class="lt"><div class="ltt">🏀 ${esc(t.team)}</div>${cats}</div>` : '';
         }).join('');
-        return teams ? `<details class="lr" data-r="${esc(r.id)}" ${q || opened.has(String(r.id)) ? 'open' : ''}><summary>${esc(r.lib)}</summary>${teams}</details>` : '';
+        const rc = r.teams.flatMap(t => t.cats.flatMap(c => c.folders.flatMap(f => f.clips))), rAll = rc.every(x => chosen.has(x.id)), rSome = rc.some(x => chosen.has(x.id));
+        return teams ? `<details class="lr" data-r="${esc(r.id)}" ${q || opened.has(String(r.id)) ? 'open' : ''}><summary><input type="checkbox" class="lrc" data-m="${esc(r.id)}" title="Elegir todos los clips del partido" ${rAll ? 'checked' : ''} ${!rAll && rSome ? 'data-mixed="1"' : ''}> ${esc(r.lib)} <span class="note">${rc.length} clip${rc.length === 1 ? '' : 's'}</span></summary>${teams}</details>` : '';
       }).join('');
       const sc = $('#lBody').scrollTop;   // al redibujar se conservan los partidos abiertos y el scroll
       $('#lBody').innerHTML = html || '<div class="note">No hay clips que coincidan.</div>'; $('#lBody').scrollTop = sc;
       $$('#lBody details[data-r]').forEach(d => d.ontoggle = () => { if (d.open) opened.add(d.dataset.r); else opened.delete(d.dataset.r); });
       $$('#lBody input[data-mixed]').forEach(i => { i.indeterminate = true; });
       $$('#lBody input[data-c]').forEach(i => i.onchange = () => { const x = byId.get(i.dataset.c); if (i.checked) chosen.set(x.id, x); else chosen.delete(x.id); draw(); upd(); });
+      $$('#lBody input[data-m]').forEach(i => { i.onclick = e => e.stopPropagation(); i.onchange = () => { const r = rows.find(z => String(z.id) === i.dataset.m);
+        r.teams.forEach(t => t.cats.forEach(c => c.folders.forEach(f => f.clips.forEach(x => { if (i.checked) chosen.set(x.id, byId.get(x.id)); else chosen.delete(x.id); })))); draw(); upd(); }; });
       $$('#lBody input[data-f]').forEach(i => i.onchange = () => { const [rid, team, cat, fname] = i.dataset.f.split('|'), r = rows.find(z => String(z.id) === rid), f = r.teams.find(z => z.team === team).cats.find(z => z.cat === cat).folders.find(z => z.name === fname);
         f.clips.forEach(x => { if (i.checked) chosen.set(x.id, byId.get(x.id)); else chosen.delete(x.id); }); draw(); upd(); });
     };
