@@ -2686,7 +2686,10 @@ kbd { font: 600 11.5px var(--f); background: var(--soft); border: 1px solid var(
     const times = new Map(); lib.forEach(r => r.teams.forEach(t => t.cats.forEach(k => k.folders.forEach(f => f.clips.forEach(x => times.set(x.url, x))))));
     const load = f => new Promise((ok, ko) => { const v = document.createElement('video'); v.muted = true; v.preload = 'auto'; v.src = URL.createObjectURL(f); v.onloadeddata = () => ok(v); v.onerror = () => ko(new Error('no se puede leer ' + f.name)); });
     const srcs = []; for (const file of files) { try { srcs.push({ file, v: await load(file) }); } catch (e) { toast(e.message, 5000); } }
-    const seek = (v, t) => new Promise(ok => { const to = setTimeout(ok, 8000); v.onseeked = () => { clearTimeout(to); setTimeout(ok, 40); }; v.currentTime = t; });
+    // espera de verdad a que el vídeo esté en ese punto (con muchos clips cargándose a la vez puede tardar): si no llega, se reintenta una vez
+    const seek1 = (v, t, ms) => new Promise(ok => { const to = setTimeout(() => ok(false), ms); v.onseeked = () => { clearTimeout(to); setTimeout(() => ok(true), 40); }; v.currentTime = t; });
+    const seek = async (v, t) => { for (let k = 0; k < 2; k++) { if (await seek1(v, t, 20000) && !v.seeking && v.readyState >= 2 && Math.abs(v.currentTime - t) < 0.3) return true; await sleep(300); } return false; };
+    const dif = (q, ref) => { let e = 0; for (let i = 0; i < q.length; i += 8) e += Math.abs(q[i] - ref[i]); return e / (q.length / 8); };
     const cv = document.createElement('canvas'); cv.width = 160; cv.height = 90; const cx = cv.getContext('2d', { willReadFrequently: true });
     const sig = v => { cx.drawImage(v, 0, 0, 160, 90); return cx.getImageData(0, 0, 160, 90).data; };
     let ok = 0, n = 0; const bad = [];
@@ -2694,9 +2697,14 @@ kbd { font: 600 11.5px var(--f); background: var(--soft); border: 1px solid var(
       toast(`Recuperando ${n} de ${need.length}: ${c.name}…`, 600000);
       const x = c.lib && times.get(c.lib); if (!x || x.a == null || x.b == null) { bad.push(c.name); continue; }
       const f = S.files.get(c.key); let v0 = null;
-      try { v0 = await load(f.file); const probe = Math.min(0.5, (f.held && f.held[0] ? f.held[0].t : 1) * 0.5); await seek(v0, probe); const ref = sig(v0); let best = null, bestD = 1e9;
-        for (const s of srcs) { if (!(s.v.duration > x.b - 0.5)) continue; await seek(s.v, x.a + probe); const q = sig(s.v); let e = 0; for (let i = 0; i < q.length; i += 8) e += Math.abs(q[i] - ref[i]); e /= q.length / 8; if (e < bestD) { bestD = e; best = s; } }
-        if (!best || bestD > 14) { bad.push(c.name); continue; }
+      try { v0 = await load(f.file);
+        // se compara en varios puntos del clip antes del parón (un clip grabado puede ir unas décimas desplazado o con un fotograma repetido): vale el que mejor coincide
+        const lim = Math.max(0.3, (f.held && f.held[0] ? f.held[0].t : (x.b - x.a)) - 0.2), probes = [0.5, 0.25, 1, 1.4, 0.1].filter(p => p <= lim); if (!probes.length) probes.push(0.1);
+        let best = null, bestD = 1e9;
+        for (const probe of probes) { if (!(await seek(v0, probe))) continue; const ref = sig(v0).slice();
+          for (const s of srcs) { if (!(s.v.duration > x.b - 0.5)) continue; for (const o of [0, -0.12, 0.12, 0.3]) { if (!(await seek(s.v, Math.max(0, x.a + probe + o)))) continue; const e = dif(sig(s.v), ref); if (e < bestD) { bestD = e; best = s; } if (e < 6) break; } }
+          if (bestD < 6) break; }
+        if (!best || bestD > 14) { console.warn('recuperar: no coincide', c.name, bestD); bad.push(c.name); continue; }
         const blob = await _cutClipExact(best.file, x.a, x.b, null, best.v), file = new File([blob], c.key.split('/').pop(), { type: 'video/mp4' });
         await cleanPut(c.lib, blob); if (f.url) URL.revokeObjectURL(f.url);
         S.files.set(c.key, { file, url: URL.createObjectURL(file), held: [] }); S.thumbs.delete(c.key); restoreClipTimes(c); ok++;
